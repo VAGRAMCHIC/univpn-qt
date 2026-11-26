@@ -10,11 +10,11 @@ makedepends="qt6-base-devel qt6-declarative-devel qt6-quickcontrols2-devel qt6-s
 # Зависимости для работы
 depends="qt6-quickcontrols2 qt6-svg"
 short_desc="Qt6 VPN client for sing-box"
-maintainer="Your Name <your@email.com>"
+maintainer="VAGRAMCHIC <vagramchic@gmail.com>"
 license="GPL-3.0-or-later"
-homepage="https://github.com/yourusername/univpn-qt"
-distfiles="https://github.com/yourusername/univpn-qt/archive/refs/tags/v${version}.tar.gz"
-checksum=0000000000000000000000000000000000000000000000000000000000000000 # Замените на реальный!
+homepage="https://github.com/VAGRAMCHIC/univpn-qt"
+distfiles="https://github.com/VAGRAMCHIC/univpn-qt/archive/refs/tags/v${version}.tar.gz"
+checksum=63b3454dae8d658f80a34495fe059ed20fa339fa236f8895178022a231ba42d8 # Замените на реальный!
 
 post_install() {
     # Установка desktop-файла и иконок, если они есть
