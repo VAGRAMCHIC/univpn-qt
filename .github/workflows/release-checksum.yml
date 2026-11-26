@@ -1,0 +1,27 @@
+name: Attach Checksum to Release
+
+on:
+  release:
+    types: [published]  # Срабатывает при публикации релиза
+
+permissions:
+  contents: write  # Требуется для загрузки файлов в релиз
+
+jobs:
+  checksum:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate SHA256SUMS
+        run: |
+          # Создаём файл с чек-суммой для текущего кода (исключая каталоги .git и workflows)
+          find . -type f -not -path './.git/*' -not -path './.github/*' -exec sha256sum {} \; > SHA256SUMS
+
+      - name: Upload SHA256SUMS to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

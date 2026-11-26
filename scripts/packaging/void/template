@@ -1,14 +1,13 @@
 # Template file for 'univpn-qt'
 pkgname=univpn-qt
-version=0.1.0
+version=0.1.2
 revision=1
 build_style=cmake
 configure_args="-DCMAKE_BUILD_TYPE=Release"
 # Зависимости для сборки (компилятор, cmake, qt6-devel и т.д.)
 hostmakedepends="cmake pkg-config qt6-base-devel qt6-declarative-devel qt6-tools-devel"
-makedepends="qt6-base-devel qt6-declarative-devel qt6-quickcontrols2-devel qt6-svg-devel qt6-network-devel"
-# Зависимости для работы
-depends="qt6-quickcontrols2 qt6-svg"
+makedepends="qt6-base-devel qt6-declarative-devel qt6-svg-devel"
+depends="qt6-base qt6-declarative qt6-declarative-host-tools qt6-network qt6-svg"
 short_desc="Qt6 VPN client for sing-box"
 maintainer="VAGRAMCHIC <vagramchic@gmail.com>"
 license="GPL-3.0-or-later"
