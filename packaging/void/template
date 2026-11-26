@@ -1,0 +1,31 @@
+# Template file for 'univpn-qt'
+pkgname=univpn-qt
+version=0.1.0
+revision=1
+build_style=cmake
+configure_args="-DCMAKE_BUILD_TYPE=Release"
+# Зависимости для сборки (компилятор, cmake, qt6-devel и т.д.)
+hostmakedepends="cmake pkg-config qt6-base-devel qt6-declarative-devel qt6-tools-devel"
+makedepends="qt6-base-devel qt6-declarative-devel qt6-quickcontrols2-devel qt6-svg-devel qt6-network-devel"
+# Зависимости для работы
+depends="qt6-quickcontrols2 qt6-svg"
+short_desc="Qt6 VPN client for sing-box"
+maintainer="Your Name <your@email.com>"
+license="GPL-3.0-or-later"
+homepage="https://github.com/yourusername/univpn-qt"
+distfiles="https://github.com/yourusername/univpn-qt/archive/refs/tags/v${version}.tar.gz"
+checksum=0000000000000000000000000000000000000000000000000000000000000000 # Замените на реальный!
+
+post_install() {
+    # Установка desktop-файла и иконок, если они есть
+    if [ -f "$FILESDIR/univpn-qt.desktop" ]; then
+        vinstall "$FILESDIR/univpn-qt.desktop" 644 usr/share/applications
+    fi
+    if [ -f "$FILESDIR/univpn-qt.png" ]; then
+        vinstall "$FILESDIR/univpn-qt.png" 644 usr/share/icons/hicolor/128x128/apps
+    fi
+}
+
+# Пост-установочные действия (например, установка патченного sing-box)
+# Если вы хотите, чтобы пакет тянул за собой ваш кастомный sing-box,
+# его нужно собрать отдельным шаблоном и указать в depends.

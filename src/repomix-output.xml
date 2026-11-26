@@ -1,0 +1,3677 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+core/
+  engine/
+    clash_api.cpp
+    clash_api.h
+    core_install.cpp
+    core_install.h
+    desktop_engine.cpp
+    desktop_engine.h
+    ip_check.cpp
+    ip_check.h
+    kill_switch.cpp
+    kill_switch.h
+    log_buffer.cpp
+    log_buffer.h
+    privileges.cpp
+    privileges.h
+    tunnel_controller.cpp
+    tunnel_controller.h
+    tunnel_state.h
+  model/
+    vpn_node.cpp
+    vpn_node.h
+  settings/
+    app_settings.cpp
+    app_settings.h
+  singbox/
+    config_builder.cpp
+    config_builder.h
+  storage/
+    app_paths.cpp
+    app_paths.h
+    settings_store.cpp
+    settings_store.h
+    subscription_store.cpp
+    subscription_store.h
+  subscription/
+    auto_refresh.cpp
+    auto_refresh.h
+    link_parser.cpp
+    link_parser.h
+    subscription_manager.cpp
+    subscription_manager.h
+    subscription_parser.cpp
+    subscription_parser.h
+    subscription_service.cpp
+    subscription_service.h
+    subscription.cpp
+    subscription.h
+  util/
+    app_exception.h
+    base64.cpp
+    base64.h
+    format.cpp
+    format.h
+    stable_hash.cpp
+    stable_hash.h
+  app_controller.cpp
+  app_controller.h
+main.cpp
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="core/engine/clash_api.cpp">
+#include "clash_api.h"
+
+#include <QNetworkReply>
+#include <QUrlQuery>
+#include <QJsonDocument>
+#include <QTimer>
+
+ClashApiClient::ClashApiClient(int port, QString secret, QString host,
+                               QObject *parent)
+    : QObject(parent)
+    , m_port(port)
+    , m_secret(std::move(secret))
+    , m_host(std::move(host))
+{}
+
+QUrl ClashApiClient::urlFor(const QString &path) const
+{
+    QUrl u;
+    u.setScheme(QStringLiteral("http"));
+    u.setHost(m_host);
+    u.setPort(m_port);
+    u.setPath(path);
+    return u;
+}
+
+QNetworkRequest ClashApiClient::makeRequest(const QString &path) const
+{
+    QNetworkRequest req(urlFor(path));
+    if (!m_secret.isEmpty())
+        req.setRawHeader("Authorization",
+                         QByteArray("Bearer ") + m_secret.toUtf8());
+    req.setHeader(QNetworkRequest::ContentTypeHeader,
+                  QStringLiteral("application/json"));
+    return req;
+}
+
+void ClashApiClient::fetchVersion()
+{
+    auto *reply = m_network.get(makeRequest(QStringLiteral("/version")));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) return;
+        const auto doc = QJsonDocument::fromJson(reply->readAll());
+        if (doc.isObject()) emit versionReceived(doc.object());
+    });
+}
+
+void ClashApiClient::waitReady(int timeoutMs)
+{
+    auto *ticker = new QTimer(this);
+    auto *deadline = new QTimer(this);
+    deadline->setSingleShot(true);
+    deadline->setInterval(timeoutMs);
+    ticker->setInterval(150);
+
+    connect(deadline, &QTimer::timeout, this,
+            [this, ticker, deadline, timeoutMs]() {
+        ticker->stop();
+        ticker->deleteLater();
+        deadline->deleteLater();
+        emit readyFailed(QStringLiteral("Clash API не поднялся за %1 мс")
+                             .arg(timeoutMs));
+    });
+
+    connect(ticker, &QTimer::timeout, this, [this, ticker, deadline]() {
+        auto *reply = m_network.get(makeRequest(QStringLiteral("/version")));
+        connect(reply, &QNetworkReply::finished, this,
+                [this, reply, ticker, deadline]() {
+            reply->deleteLater();
+            if (reply->error() != QNetworkReply::NoError) return;
+            ticker->stop();
+            ticker->deleteLater();
+            deadline->deleteLater();
+            emit ready();
+        });
+    });
+
+    deadline->start();
+    ticker->start();
+}
+
+void ClashApiClient::fetchTotals()
+{
+    auto *reply = m_network.get(makeRequest(QStringLiteral("/connections")));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) return;
+        const auto doc = QJsonDocument::fromJson(reply->readAll());
+        if (!doc.isObject()) return;
+        const auto o = doc.object();
+        const qint64 down =
+            o.value(QStringLiteral("downloadTotal")).toVariant().toLongLong();
+        const qint64 up =
+            o.value(QStringLiteral("uploadTotal")).toVariant().toLongLong();
+        emit totalsReceived(down, up);
+    });
+}
+
+void ClashApiClient::fetchDelay(const QString &tag, const QString &url,
+                                int timeoutMs)
+{
+    QUrl u = urlFor(QStringLiteral("/proxies/%1/delay")
+                        .arg(QString::fromUtf8(QUrl::toPercentEncoding(tag))));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("url"), url);
+    q.addQueryItem(QStringLiteral("timeout"), QString::number(timeoutMs));
+    u.setQuery(q);
+
+    QNetworkRequest req(u);
+    if (!m_secret.isEmpty())
+        req.setRawHeader("Authorization",
+                         QByteArray("Bearer ") + m_secret.toUtf8());
+
+    auto *reply = m_network.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, tag]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit delayReceived(tag, std::nullopt);
+            return;
+        }
+        const auto doc = QJsonDocument::fromJson(reply->readAll());
+        if (!doc.isObject()) {
+            emit delayReceived(tag, std::nullopt);
+            return;
+        }
+        const auto v = doc.object().value(QStringLiteral("delay"));
+        emit delayReceived(tag, v.isDouble() ? std::optional<int>(v.toInt())
+                                             : std::nullopt);
+    });
+}
+
+void ClashApiClient::select(const QString &group, const QString &tag)
+{
+    auto req = makeRequest(
+        QStringLiteral("/proxies/%1")
+            .arg(QString::fromUtf8(QUrl::toPercentEncoding(group))));
+    QJsonObject body;
+    body[QStringLiteral("name")] = tag;
+
+    auto *reply = m_network.put(req, QJsonDocument(body).toJson());
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        const bool ok = reply->error() == QNetworkReply::NoError;
+        emit selectFinished(ok, ok ? QString() : reply->errorString());
+    });
+}
+</file>
+
+<file path="core/engine/clash_api.h">
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QUrl>
+#include <QJsonObject>
+#include <optional>
+
+/// Минимальный клиент Clash API sing-box: версия, трафик, задержка, выбор узла.
+class ClashApiClient : public QObject {
+    Q_OBJECT
+public:
+    ClashApiClient(int port,
+                   QString secret = {},
+                   QString host = QStringLiteral("127.0.0.1"),
+                   QObject *parent = nullptr);
+
+    /// Ждёт, пока управляющий API поднимется после старта ядра.
+    /// Испускает ready() или readyFailed(QString).
+    void waitReady(int timeoutMs = 10000);
+
+    void fetchVersion();
+    void fetchTotals();
+    void fetchDelay(const QString &tag,
+                    const QString &url = QStringLiteral(
+                        "https://www.gstatic.com/generate_204"),
+                    int timeoutMs = 3000);
+    void select(const QString &group, const QString &tag);
+
+signals:
+    void ready();
+    void readyFailed(const QString &error);
+    void versionReceived(const QJsonObject &version);
+    void totalsReceived(qint64 download, qint64 upload);
+    void delayReceived(const QString &tag, std::optional<int> milliseconds);
+    void selectFinished(bool ok, const QString &error);
+
+private:
+    QUrl urlFor(const QString &path) const;
+    QNetworkRequest makeRequest(const QString &path) const;
+
+    int m_port;
+    QString m_secret;
+    QString m_host;
+    QNetworkAccessManager m_network;
+};
+</file>
+
+<file path="core/engine/core_install.cpp">
+#include "core_install.h"
+
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QProcessEnvironment>
+#include <stdexcept>
+
+namespace {
+
+QString osName()
+{
+#if defined(Q_OS_WIN)
+    return QStringLiteral("windows");
+#elif defined(Q_OS_LINUX)
+    return QStringLiteral("linux");
+#else
+    return QStringLiteral("unknown");
+#endif
+}
+
+QString archName()
+{
+#if defined(Q_PROCESSOR_X86_64)
+    return QStringLiteral("amd64");
+#elif defined(Q_PROCESSOR_ARM_64)
+    return QStringLiteral("arm64");
+#elif defined(Q_PROCESSOR_ARM)
+    return QStringLiteral("arm");
+#else
+    return QStringLiteral("amd64");
+#endif
+}
+
+QString binaryName()
+{
+#ifdef Q_OS_WIN
+    return QStringLiteral("sing-box.exe");
+#else
+    return QStringLiteral("sing-box");
+#endif
+}
+
+} // namespace
+
+CoreInstall CoreInstall::resolve()
+{
+    const QString exeDir = QCoreApplication::applicationDirPath();
+    const QString cwd = QDir::currentPath();
+    const QString distName =
+        QStringLiteral("%1-%2").arg(osName(), archName());
+
+    QStringList candidates;
+    const QString env = QProcessEnvironment::systemEnvironment()
+                            .value(QString::fromLatin1(envBinary));
+    if (!env.isEmpty()) candidates << env;
+
+    candidates
+        << QDir(exeDir).filePath(binaryName())
+        << QDir(exeDir).filePath(
+               QStringLiteral("../core/dist/%1/%2").arg(distName, binaryName()))
+        << QDir(cwd).filePath(
+               QStringLiteral("core/dist/%1/%2").arg(distName, binaryName()))
+        << QDir(cwd).filePath(
+               QStringLiteral("../core/dist/%1/%2").arg(distName, binaryName()));
+
+    QString binary;
+    for (const auto &c : candidates) {
+        const QString normalized =
+            QDir::cleanPath(QFileInfo(c).absoluteFilePath());
+        if (QFileInfo::exists(normalized)) {
+            binary = normalized;
+            break;
+        }
+    }
+
+    if (binary.isEmpty()) {
+        throw std::runtime_error(
+            QStringLiteral("Ядро sing-box не найдено. Проверены пути:\n%1\n"
+                           "Соберите его: core/build_desktop.sh %2 %3")
+                .arg(candidates.join(QLatin1Char('\n')), osName(), archName())
+                .toStdString());
+    }
+
+    std::optional<QString> ruleSets;
+    const QStringList dirCandidates = {
+        QDir(exeDir).filePath(QStringLiteral("rulesets")),
+        QDir(cwd).filePath(QStringLiteral("rulesets/dist")),
+        QDir(cwd).filePath(QStringLiteral("../rulesets/dist")),
+    };
+    for (const auto &dir : dirCandidates) {
+        const QString domain = QDir(dir).filePath(
+            QStringLiteral("geosite-category-ru.srs"));
+        const QString cidr = QDir(dir).filePath(QStringLiteral("geoip-ru.srs"));
+        if (QFileInfo::exists(domain) && QFileInfo::exists(cidr)) {
+            ruleSets = QDir::cleanPath(dir);
+            break;
+        }
+    }
+
+    return CoreInstall{binary, ruleSets};
+}
+</file>
+
+<file path="core/engine/core_install.h">
+#pragma once
+
+#include <QString>
+#include <optional>
+
+/// Где лежит ядро и наборы правил.
+struct CoreInstall {
+    QString binary;
+    std::optional<QString> ruleSetsDir;
+
+    static constexpr const char *envBinary = "CLGVPN_SINGBOX";
+
+    /// Ищет ядро рядом с приложением, в переменной окружения и в core/dist.
+    /// Бросает std::runtime_error, если не нашёл.
+    static CoreInstall resolve();
+};
+</file>
+
+<file path="core/engine/desktop_engine.cpp">
+#include "desktop_engine.h"
+#include "clash_api.h"
+
+#include <QDir>
+#include <QFile>
+
+DesktopEngine::DesktopEngine(QString workingDir, QString binaryPath,
+                             QObject *parent)
+    : QObject(parent)
+    , m_workingDir(std::move(workingDir))
+    , m_binaryPath(std::move(binaryPath))
+{}
+
+DesktopEngine::~DesktopEngine() { stop(); }
+
+void DesktopEngine::start(const QString &configJson, int clashApiPort)
+{
+    if (m_process) {
+        emit startFailed(QStringLiteral("Ядро уже запущено"));
+        return;
+    }
+
+    QDir().mkpath(m_workingDir);
+    const QString configPath =
+        QDir(m_workingDir).filePath(QStringLiteral("config.json"));
+    {
+        QFile f(configPath);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            emit startFailed(QStringLiteral("Не удалось записать конфиг: %1")
+                                 .arg(configPath));
+            return;
+        }
+        f.write(configJson.toUtf8());
+    }
+
+    m_process = new QProcess(this);
+    m_process->setWorkingDirectory(m_workingDir);
+    m_process->setProcessChannelMode(QProcess::SeparateChannels);
+
+    connect(m_process, &QProcess::readyReadStandardOutput,
+            this, &DesktopEngine::onStdout);
+    connect(m_process, &QProcess::readyReadStandardError,
+            this, &DesktopEngine::onStderr);
+    connect(m_process,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this](int code, QProcess::ExitStatus) {
+        if (m_process) { m_process->deleteLater(); m_process = nullptr; }
+        if (!m_stopping)
+            appendLine(QStringLiteral("Ядро завершилось с кодом %1").arg(code));
+        emit exited(code);
+    });
+
+    m_process->start(m_binaryPath,
+                     {QStringLiteral("-D"), m_workingDir,
+                      QStringLiteral("run"), QStringLiteral("-c"), configPath});
+    if (!m_process->waitForStarted(5000)) {
+        m_process->deleteLater();
+        m_process = nullptr;
+        emit startFailed(QStringLiteral("Не удалось запустить ядро: %1")
+                             .arg(m_binaryPath));
+        return;
+    }
+
+    auto *api = new ClashApiClient(clashApiPort, {}, {}, this);
+    connect(api, &ClashApiClient::ready, this, [this, api]() {
+        api->deleteLater();
+        emit started();
+    });
+    connect(api, &ClashApiClient::readyFailed, this,
+            [this, api](const QString &err) {
+        api->deleteLater();
+        const QString tailText = m_tail.join(QLatin1Char('\n'));
+        stop();
+        emit startFailed(QStringLiteral("Ядро не поднялось: %1\n%2")
+                             .arg(err, tailText));
+    });
+    api->waitReady();
+}
+
+void DesktopEngine::stop()
+{
+    if (!m_process) return;
+    m_stopping = true;
+    m_process->terminate();
+    if (!m_process->waitForFinished(5000)) {
+        m_process->kill();
+        m_process->waitForFinished(2000);
+    }
+    if (m_process) { m_process->deleteLater(); m_process = nullptr; }
+    m_stopping = false;
+}
+
+void DesktopEngine::onStdout()
+{
+    if (!m_process) return;
+    const QString text = QString::fromUtf8(m_process->readAllStandardOutput());
+    for (const auto &line : text.split(QLatin1Char('\n'), Qt::SkipEmptyParts))
+        appendLine(line);
+}
+
+void DesktopEngine::onStderr()
+{
+    if (!m_process) return;
+    const QString text = QString::fromUtf8(m_process->readAllStandardError());
+    for (const auto &line : text.split(QLatin1Char('\n'), Qt::SkipEmptyParts))
+        appendLine(line);
+}
+
+void DesktopEngine::appendLine(const QString &line)
+{
+    if (line.trimmed().isEmpty()) return;
+    m_tail.append(line);
+    while (m_tail.size() > kTailSize) m_tail.removeFirst();
+    emit logLine(line);
+}
+</file>
+
+<file path="core/engine/desktop_engine.h">
+#pragma once
+
+#include <QObject>
+#include <QProcess>
+#include <QString>
+#include <QStringList>
+
+/// Запускает sing-box отдельным процессом (Windows/Linux).
+class DesktopEngine : public QObject {
+    Q_OBJECT
+public:
+    DesktopEngine(QString workingDir, QString binaryPath,
+                  QObject *parent = nullptr);
+    ~DesktopEngine() override;
+
+    /// Запускает процесс с готовым конфигом и ждёт Clash API.
+    /// Испускает started() или startFailed(QString).
+    void start(const QString &configJson, int clashApiPort);
+
+    void stop();
+
+    QStringList recentLogs() const { return m_tail; }
+
+signals:
+    void started();
+    void startFailed(const QString &error);
+    void logLine(const QString &line);
+    void exited(int code);
+
+private:
+    void onStdout();
+    void onStderr();
+    void appendLine(const QString &line);
+
+    static constexpr int kTailSize = 200;
+
+    QString m_workingDir;
+    QString m_binaryPath;
+    QProcess *m_process = nullptr;
+    bool m_stopping = false;
+    QStringList m_tail;
+};
+</file>
+
+<file path="core/engine/ip_check.cpp">
+#include "ip_check.h"
+
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QNetworkProxy>
+#include <QRegularExpression>
+
+IpCheckService::IpCheckService(QObject *parent)
+    : QObject(parent)
+{}
+
+void IpCheckService::fetch(std::optional<int> proxyPort)
+{
+    if (proxyPort.has_value()) {
+        m_network.setProxy(QNetworkProxy(
+            QNetworkProxy::HttpProxy,
+            QStringLiteral("127.0.0.1"),
+            static_cast<quint16>(*proxyPort)));
+    } else {
+        m_network.setProxy(QNetworkProxy::NoProxy);
+    }
+
+    QNetworkRequest req{QUrl(m_endpoint)};   // ← фигурные скобки
+    req.setTransferTimeout(8000);
+
+    auto *reply = m_network.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit fetched(std::nullopt);
+            return;
+        }
+        const QString body = QString::fromUtf8(reply->readAll()).trimmed();
+        static const QRegularExpression valid(
+            QStringLiteral("^[0-9a-fA-F:.]{3,45}$"));
+        if (valid.match(body).hasMatch())
+            emit fetched(body);
+        else
+            emit fetched(std::nullopt);
+    });
+}
+</file>
+
+<file path="core/engine/ip_check.h">
+// ip_check.h
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QNetworkAccessManager>
+#include <optional>
+
+/// Запрашивает внешний IP, чтобы показать, что трафик идёт через туннель.
+class IpCheckService : public QObject {
+    Q_OBJECT
+
+public:
+    explicit IpCheckService(QObject *parent = nullptr);
+
+    /// proxyPort задан — идём через локальный HTTP-прокси sing-box (mixed inbound).
+    /// Иначе запрос идёт напрямую.
+    void fetch(std::optional<int> proxyPort = std::nullopt);
+
+signals:
+    void fetched(std::optional<QString> ip);
+
+private:
+    QNetworkAccessManager m_network;
+    QString m_endpoint = QStringLiteral("https://api.ipify.org");
+};
+</file>
+
+<file path="core/engine/kill_switch.cpp">
+// kill_switch.cpp
+#include "kill_switch.h"
+
+#include <QProcess>
+
+KillSwitch::KillSwitch(QString helper, QString privilegedLauncher)
+    : m_helper(std::move(helper))
+    , m_launcher(std::move(privilegedLauncher))
+{}
+
+QString KillSwitch::call(const QStringList &args, QString *errorOut)
+{
+    QProcess p;
+    p.start(m_launcher, QStringList{m_helper} + args);
+    if (!p.waitForFinished(30000)) {
+        if (errorOut)
+            *errorOut = QStringLiteral("pkexec не ответил за 30 секунд");
+        return {};
+    }
+    if (p.exitCode() != 0) {
+        const QString err = QString::fromUtf8(p.readAllStandardError()).trimmed();
+        if (errorOut) {
+            *errorOut = err.isEmpty()
+                            ? QStringLiteral("Kill switch завершился с кодом %1")
+                                  .arg(p.exitCode())
+                            : err;
+        }
+    }
+    return QString::fromUtf8(p.readAllStandardOutput());
+}
+
+QString KillSwitch::enable(const QStringList &serverAddresses)
+{
+    QString err;
+    call(QStringList{QStringLiteral("up")} + serverAddresses, &err);
+    return err;
+}
+
+QString KillSwitch::disable()
+{
+    QString err;
+    call({QStringLiteral("down")}, &err);
+    return err;
+}
+
+bool KillSwitch::isEnabled()
+{
+    QString err;
+    const QString out = call({QStringLiteral("status")}, &err);
+    return err.isEmpty() && out.trimmed() == QStringLiteral("on");
+}
+</file>
+
+<file path="core/engine/kill_switch.h">
+// kill_switch.h
+#pragma once
+
+#include <QString>
+#include <QStringList>
+
+/// Управляет системным kill switch через helper из пакета.
+///
+/// Helper — `clgvpn-killswitch` с nftables-таблицей; запускается через pkexec,
+/// потому что правила netfilter требуют root. Пакет ставит polkit-правило,
+/// поэтому запрос пароля не появляется.
+class KillSwitch {
+public:
+    explicit KillSwitch(QString helper = defaultHelper(),
+                        QString privilegedLauncher = QStringLiteral("pkexec"));
+
+    /// Включает блокировку, разрешая только адреса VPN-сервера.
+    /// Возвращает пустую строку при успехе или текст ошибки.
+    QString enable(const QStringList &serverAddresses);
+    QString disable();
+    bool isEnabled();
+
+    static QString defaultHelper()
+    { return QStringLiteral("/usr/lib/clgvpn/clgvpn-killswitch"); }
+
+private:
+    QString call(const QStringList &args, QString *errorOut);
+
+    QString m_helper;
+    QString m_launcher;
+};
+</file>
+
+<file path="core/engine/log_buffer.cpp">
+// log_buffer.cpp
+#include "log_buffer.h"
+
+LogBuffer::LogBuffer(QObject *parent) : QObject(parent) {}
+
+void LogBuffer::add(const QString &line) { addAll({line}); }
+
+void LogBuffer::addAll(const QStringList &lines)
+{
+    bool changedFlag = false;
+    for (const auto &line : lines) {
+        if (line.trimmed().isEmpty()) continue;
+        m_lines.append(line);
+        changedFlag = true;
+    }
+    while (m_lines.size() > kLimit)
+        m_lines.removeFirst();
+    if (changedFlag) emit changed();
+}
+
+void LogBuffer::clear()
+{
+    if (m_lines.isEmpty()) return;
+    m_lines.clear();
+    emit changed();
+}
+</file>
+
+<file path="core/engine/log_buffer.h">
+// log_buffer.h
+#pragma once
+
+#include <QObject>
+#include <QStringList>
+
+/// Кольцевой буфер логов ядра для экрана диагностики.
+class LogBuffer : public QObject {
+    Q_OBJECT
+
+public:
+    explicit LogBuffer(QObject *parent = nullptr);
+
+    QStringList lines() const { return m_lines; }
+
+    void add(const QString &line);
+    void addAll(const QStringList &lines);
+    void clear();
+
+    static constexpr int kLimit = 500;
+
+signals:
+    void changed();
+
+private:
+    QStringList m_lines;
+};
+</file>
+
+<file path="core/engine/privileges.cpp">
+// privileges.cpp
+#include "privileges.h"
+
+#include <QProcess>
+#include <QStandardPaths>
+
+bool Privileges::canCreateTun(const QString &binaryPath, const QString &getcap)
+{
+#ifdef Q_OS_LINUX
+    QProcess p;
+    p.start(getcap, {binaryPath});
+    if (!p.waitForFinished(3000)) return false;
+    if (p.exitCode() != 0) return false;
+
+    const QString out = QString::fromUtf8(p.readAllStandardOutput()).toLower();
+    return out.contains(QStringLiteral("cap_net_admin"));
+#else
+    Q_UNUSED(binaryPath);
+    Q_UNUSED(getcap);
+    return false;
+#endif
+}
+</file>
+
+<file path="core/engine/privileges.h">
+// privileges.h
+#pragma once
+
+#include <QString>
+
+/// Может ли приложение поднять TUN без запроса root.
+/// Linux: проверяем файловые capabilities на бинаре ядра.
+/// Windows: false (TUN требует прав администратора).
+class Privileges {
+public:
+    static bool canCreateTun(const QString &binaryPath,
+                             const QString &getcap = QStringLiteral("getcap"));
+};
+</file>
+
+<file path="core/engine/tunnel_controller.cpp">
+#include "tunnel_controller.h"
+
+#include "desktop_engine.h"
+#include "clash_api.h"
+#include "core_install.h"
+#include "privileges.h"
+#include "kill_switch.h"
+#include "log_buffer.h"
+#include "../singbox/config_builder.h"
+
+#include <QJsonDocument>
+#include <QTcpServer>
+
+TunnelController::TunnelController(QObject *parent)
+    : QObject(parent)
+    , m_logs(new LogBuffer(this))
+    , m_killSwitch(std::make_unique<KillSwitch>())
+{
+    m_statsTimer.setInterval(2000);
+    connect(&m_statsTimer, &QTimer::timeout, this, [this]() {
+        if (m_api && isConnected(m_state.status))
+            m_api->fetchTotals();
+    });
+}
+
+TunnelController::~TunnelController()
+{
+    if (m_killSwitchActive)
+        m_killSwitch->disable();
+    teardown();
+}
+
+void TunnelController::setState(TunnelState next)
+{
+    m_state = std::move(next);
+    emit stateChanged(m_state);
+}
+
+void TunnelController::start(const VpnNode &node,
+                             const QString &workingDir,
+                             const AppSettings &settings)
+{
+    if (isBusy(m_state.status) || isConnected(m_state.status)) return;
+
+    m_currentNode = node;
+
+    TunnelState s;
+    s.status = TunnelStatus::Connecting;
+    s.serverName = node.name;
+    setState(s);
+
+    CoreInstall install;
+    try {
+        install = CoreInstall::resolve();
+    } catch (const std::exception &e) {
+        s.status = TunnelStatus::Disconnected;
+        s.error = QString::fromStdString(e.what());
+        setState(s);
+        return;
+    }
+
+    const bool proxyMode = !Privileges::canCreateTun(install.binary);
+    const TunnelMode mode = proxyMode ? TunnelMode::Proxy : TunnelMode::Tun;
+    const int clashPort = freePort();
+
+    SingBoxConfigBuilder builder;
+    builder.setNodes({node})
+        .setSelectedTag(node.tag)
+        .setMode(settings.routingMode)
+        .setClashApiPort(clashPort);
+    if (proxyMode)
+        builder.setMixedPort(kDesktopMixedPort);
+    if (install.ruleSetsDir.has_value())
+        builder.setRuleSetDirectory(*install.ruleSetsDir);
+
+    const QJsonObject cfg = builder.build();
+    const QByteArray cfgJson =
+        QJsonDocument(cfg).toJson(QJsonDocument::Compact);
+
+    m_engine = new DesktopEngine(workingDir, install.binary, this);
+    connect(m_engine, &DesktopEngine::logLine,
+            m_logs, &LogBuffer::add);
+
+    connect(m_engine, &DesktopEngine::started, this,
+            [this, clashPort, mode, settings, node, proxyMode]() {
+        m_api = new ClashApiClient(clashPort, {}, {}, this);
+        connect(m_api, &ClashApiClient::totalsReceived, this,
+                [this](qint64 down, qint64 up) {
+            m_state.downloadedBytes = down;
+            m_state.uploadedBytes = up;
+            emit stateChanged(m_state);
+        });
+
+        TunnelState st = m_state;
+        st.status = TunnelStatus::Connected;
+        st.clashApiPort = clashPort;
+        st.mode = mode;
+        st.connectedAt = QDateTime::currentDateTimeUtc();
+        if (proxyMode) st.hint = TunnelHint::TunUnavailable;
+        setState(st);
+
+        if (settings.killSwitch && mode == TunnelMode::Tun)
+            enableKillSwitch(node.server);
+
+        startStats();
+    });
+
+    connect(m_engine, &DesktopEngine::startFailed, this,
+            [this](const QString &error) {
+        teardown();
+        TunnelState st;
+        st.status = TunnelStatus::Disconnected;
+        st.error = error;
+        st.killSwitchActive = false;
+        setState(st);
+    });
+
+    m_engine->start(QString::fromUtf8(cfgJson), clashPort);
+}
+
+void TunnelController::disconnect()
+{
+    if (!isConnected(m_state.status)) return;
+
+    TunnelState s = m_state;
+    s.status = TunnelStatus::Disconnecting;
+    setState(s);
+
+    teardown();
+
+    TunnelState finalState;
+    finalState.status = TunnelStatus::Disconnected;
+    setState(finalState);
+}
+
+void TunnelController::clearError()
+{
+    if (!m_state.error.has_value()) return;
+    m_state.error.reset();
+    emit stateChanged(m_state);
+}
+
+void TunnelController::enableKillSwitch(const QString &serverAddress)
+{
+    const QString err = m_killSwitch->enable({serverAddress});
+    if (err.isEmpty()) {
+        m_killSwitchActive = true;
+        m_state.killSwitchActive = true;
+        emit stateChanged(m_state);
+    } else {
+        m_state.hint = TunnelHint::KillSwitchFailed;
+        m_state.error = err;
+        emit stateChanged(m_state);
+    }
+}
+
+void TunnelController::teardown()
+{
+    if (m_killSwitchActive) {
+        m_killSwitch->disable();
+        m_killSwitchActive = false;
+    }
+    m_statsTimer.stop();
+    if (m_api) {
+        m_api->deleteLater();
+        m_api = nullptr;
+    }
+    if (m_engine) {
+        m_engine->stop();
+        m_engine->deleteLater();
+        m_engine = nullptr;
+    }
+}
+
+void TunnelController::startStats()
+{
+    m_statsTimer.start();
+}
+
+int TunnelController::freePort()
+{
+    QTcpServer s;
+    s.listen(QHostAddress::LocalHost, 0);
+    const int port = s.serverPort();
+    s.close();
+    return port;
+}
+</file>
+
+<file path="core/engine/tunnel_controller.h">
+#pragma once
+
+#include <QObject>
+#include <QTimer>
+#include <QList>
+#include <memory>
+
+#include "tunnel_state.h"
+#include "../model/vpn_node.h"
+#include "../settings/app_settings.h"
+
+class DesktopEngine;
+class ClashApiClient;
+class KillSwitch;
+class LogBuffer;
+
+/// Порт локального SOCKS/HTTP для десктопного режима без прав администратора.
+inline constexpr int kDesktopMixedPort = 11085;
+
+/// Оркестратор туннеля: запуск ядра, статистика, kill switch, ошибки.
+///
+/// Метод запуска называется start(), а не connect(): QObject::connect
+/// зарезервирован и перекрывать его в подклассе нельзя.
+class TunnelController : public QObject {
+    Q_OBJECT
+
+public:
+    explicit TunnelController(QObject *parent = nullptr);
+    ~TunnelController() override;
+
+    TunnelState state() const { return m_state; }
+    LogBuffer *logBuffer() const { return m_logs; }
+
+    /// Запускает туннель. workingDir — каталог для config.json ядра.
+    void start(const VpnNode &node,
+               const QString &workingDir,
+               const AppSettings &settings);
+
+    void disconnect();
+    void clearError();
+
+signals:
+    void stateChanged(const TunnelState &state);
+
+private:
+    void setState(TunnelState next);
+    void teardown();
+    void startStats();
+    void enableKillSwitch(const QString &serverAddress);
+    static int freePort();
+
+    TunnelState m_state;
+    DesktopEngine *m_engine = nullptr;
+    ClashApiClient *m_api = nullptr;
+    QTimer m_statsTimer;
+    LogBuffer *m_logs = nullptr;
+    std::unique_ptr<KillSwitch> m_killSwitch;
+    bool m_killSwitchActive = false;
+    VpnNode m_currentNode;
+};
+</file>
+
+<file path="core/engine/tunnel_state.h">
+#pragma once
+
+#include <QString>
+#include <QDateTime>
+#include <optional>
+
+enum class TunnelMode { Tun, Proxy };
+enum class TunnelHint { TunUnavailable, KillSwitchFailed };
+
+enum class TunnelStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Disconnecting,
+};
+
+inline bool isBusy(TunnelStatus s)
+{ return s == TunnelStatus::Connecting || s == TunnelStatus::Disconnecting; }
+inline bool isConnected(TunnelStatus s) { return s == TunnelStatus::Connected; }
+
+struct TunnelState {
+    TunnelStatus status = TunnelStatus::Disconnected;
+    QString serverName;
+    qint64 downloadedBytes = 0;
+    qint64 uploadedBytes = 0;
+    std::optional<QString> error;
+    std::optional<TunnelHint> hint;
+    std::optional<int> clashApiPort;
+    std::optional<TunnelMode> mode;
+    std::optional<QDateTime> connectedAt;
+    bool killSwitchActive = false;
+};
+</file>
+
+<file path="core/model/vpn_node.cpp">
+#include "vpn_node.h"
+
+std::optional<VpnProtocol> protocolFromString(const QString &value)
+{
+    if (value == QLatin1String("vless")) return VpnProtocol::Vless;
+    if (value == QLatin1String("trojan")) return VpnProtocol::Trojan;
+    if (value == QLatin1String("ss") || value == QLatin1String("shadowsocks"))
+        return VpnProtocol::Shadowsocks;
+    return std::nullopt;
+}
+
+QString protocolToString(VpnProtocol protocol)
+{
+    switch (protocol) {
+    case VpnProtocol::Vless:       return QStringLiteral("vless");
+    case VpnProtocol::Trojan:      return QStringLiteral("trojan");
+    case VpnProtocol::Shadowsocks: return QStringLiteral("shadowsocks");
+    }
+    return {};
+}
+
+QString transportToString(TransportKind kind)
+{
+    switch (kind) {
+    case TransportKind::Tcp:  return QStringLiteral("tcp");
+    case TransportKind::Ws:   return QStringLiteral("ws");
+    case TransportKind::Grpc: return QStringLiteral("grpc");
+    }
+    return {};
+}
+
+TransportKind transportFromString(const QString &value)
+{
+    if (value == QLatin1String("ws"))   return TransportKind::Ws;
+    if (value == QLatin1String("grpc")) return TransportKind::Grpc;
+    return TransportKind::Tcp;
+}
+
+QJsonObject VpnNode::toJson() const
+{
+    QJsonObject o;
+    o[QStringLiteral("tag")]        = tag;
+    o[QStringLiteral("protocol")]   = protocolToString(protocol);
+    o[QStringLiteral("name")]       = name;
+    o[QStringLiteral("server")]     = server;
+    o[QStringLiteral("port")]       = port;
+
+    if (!uuid.isEmpty())        o[QStringLiteral("uuid")]        = uuid;
+    if (!password.isEmpty())    o[QStringLiteral("password")]    = password;
+    if (!method.isEmpty())      o[QStringLiteral("method")]      = method;
+    if (!flow.isEmpty())        o[QStringLiteral("flow")]        = flow;
+
+    o[QStringLiteral("transport")] = transportToString(transport);
+
+    if (!path.isEmpty())        o[QStringLiteral("path")]        = path;
+    if (!host.isEmpty())        o[QStringLiteral("host")]        = host;
+    if (!serviceName.isEmpty()) o[QStringLiteral("serviceName")] = serviceName;
+
+    o[QStringLiteral("tls")] = tls;
+
+    if (!sni.isEmpty())         o[QStringLiteral("sni")]         = sni;
+    if (alpn.has_value())
+    o[QStringLiteral("alpn")] = QJsonArray::fromStringList(*alpn);
+
+    if (!fingerprint.isEmpty()) o[QStringLiteral("fingerprint")] = fingerprint;
+
+    o[QStringLiteral("allowInsecure")] = allowInsecure;
+    o[QStringLiteral("reality")]       = reality;
+
+    if (!publicKey.isEmpty())   o[QStringLiteral("publicKey")]   = publicKey;
+    if (!shortId.isEmpty())     o[QStringLiteral("shortId")]     = shortId;
+
+    return o;
+}
+
+std::optional<VpnNode> VpnNode::fromJson(const QJsonObject &json)
+{
+    const auto proto = protocolFromString(json.value(QStringLiteral("protocol")).toString());
+    if (!proto.has_value()) return std::nullopt;
+
+    VpnNode node;
+    node.tag       = json.value(QStringLiteral("tag")).toString();
+    node.protocol  = *proto;
+    node.name      = json.value(QStringLiteral("name")).toString();
+    node.server    = json.value(QStringLiteral("server")).toString();
+    node.port      = json.value(QStringLiteral("port")).toInt();
+
+    if (node.tag.isEmpty() || node.server.isEmpty() || node.port <= 0)
+        return std::nullopt;
+
+    node.uuid        = json.value(QStringLiteral("uuid")).toString();
+    node.password    = json.value(QStringLiteral("password")).toString();
+    node.method      = json.value(QStringLiteral("method")).toString();
+    node.flow        = json.value(QStringLiteral("flow")).toString();
+
+    node.transport   = transportFromString(
+        json.value(QStringLiteral("transport")).toString(QStringLiteral("tcp")));
+
+    node.path        = json.value(QStringLiteral("path")).toString();
+    node.host        = json.value(QStringLiteral("host")).toString();
+    node.serviceName = json.value(QStringLiteral("serviceName")).toString();
+
+    node.tls         = json.value(QStringLiteral("tls")).toBool(false);
+
+    node.sni         = json.value(QStringLiteral("sni")).toString();
+
+    if (json.contains(QStringLiteral("alpn")) && json.value(QStringLiteral("alpn")).isArray()) {
+        QStringList list;
+        for (const auto &v : json.value(QStringLiteral("alpn")).toArray())
+            list.append(v.toString());
+        node.alpn = list;
+    }
+
+    node.fingerprint = json.value(QStringLiteral("fingerprint")).toString();
+
+    node.allowInsecure = json.value(QStringLiteral("allowInsecure")).toBool(false);
+    node.reality       = json.value(QStringLiteral("reality")).toBool(false);
+
+    node.publicKey   = json.value(QStringLiteral("publicKey")).toString();
+    node.shortId     = json.value(QStringLiteral("shortId")).toString();
+
+    return node;
+}
+
+QJsonObject VpnNode::toOutbound() const
+{
+    QJsonObject outbound;
+    outbound[QStringLiteral("type")]        = protocolToString(protocol);
+    outbound[QStringLiteral("tag")]         = tag;
+    outbound[QStringLiteral("server")]      = server;
+    outbound[QStringLiteral("server_port")] = port;
+
+    switch (protocol) {
+    case VpnProtocol::Vless:
+        outbound[QStringLiteral("uuid")] = uuid;
+        outbound[QStringLiteral("packet_encoding")] = QStringLiteral("xudp");
+        if (!flow.isEmpty())
+            outbound[QStringLiteral("flow")] = flow;
+        break;
+    case VpnProtocol::Trojan:
+        outbound[QStringLiteral("password")] = password;
+        break;
+    case VpnProtocol::Shadowsocks:
+        outbound[QStringLiteral("method")]   = method;
+        outbound[QStringLiteral("password")] = password;
+        break;
+    }
+
+    if (tls) {
+        QJsonObject tlsBlock;
+        tlsBlock[QStringLiteral("enabled")] = true;
+
+        QString serverName = sni;
+        if (serverName.isEmpty()) serverName = host;
+        if (serverName.isEmpty()) serverName = server;
+        tlsBlock[QStringLiteral("server_name")] = serverName;
+
+        // Reality без uTLS ядро не принимает, поэтому подставляем chrome.
+        QString effectiveFp = fingerprint;
+        if (effectiveFp.isEmpty() && reality)
+            effectiveFp = QStringLiteral("chrome");
+        if (!effectiveFp.isEmpty()) {
+            QJsonObject utls;
+            utls[QStringLiteral("enabled")]     = true;
+            utls[QStringLiteral("fingerprint")] = effectiveFp;
+            tlsBlock[QStringLiteral("utls")] = utls;
+        }
+        
+	if (alpn.has_value() && !alpn->isEmpty())
+            tlsBlock[QStringLiteral("alpn")] = QJsonArray::fromStringList(*alpn);
+
+        if (allowInsecure)
+            tlsBlock[QStringLiteral("insecure")] = true;
+
+        if (reality) {
+            QJsonObject r;
+            r[QStringLiteral("enabled")]    = true;
+            r[QStringLiteral("public_key")] = publicKey;
+            if (!shortId.isEmpty())
+                r[QStringLiteral("short_id")] = shortId;
+            tlsBlock[QStringLiteral("reality")] = r;
+        }
+
+        outbound[QStringLiteral("tls")] = tlsBlock;
+    }
+
+    switch (transport) {
+    case TransportKind::Tcp:
+        break;
+    case TransportKind::Ws: {
+        QJsonObject tr;
+        tr[QStringLiteral("type")] = QStringLiteral("ws");
+        tr[QStringLiteral("path")] = path.isEmpty() ? QStringLiteral("/") : path;
+        if (!host.isEmpty()) {
+            QJsonObject headers;
+            headers[QStringLiteral("Host")] = host;
+            tr[QStringLiteral("headers")]   = headers;
+        }
+        outbound[QStringLiteral("transport")] = tr;
+        break;
+    }
+    case TransportKind::Grpc: {
+        QJsonObject tr;
+        tr[QStringLiteral("type")]         = QStringLiteral("grpc");
+        tr[QStringLiteral("service_name")] = serviceName; // пусто -> ""
+        outbound[QStringLiteral("transport")] = tr;
+        break;
+    }
+    }
+
+    return outbound;
+}
+</file>
+
+<file path="core/model/vpn_node.h">
+#pragma once
+
+#include <QString>
+#include <QStringList>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <optional>
+
+enum class VpnProtocol {
+    Vless,
+    Trojan,
+    Shadowsocks
+};
+
+enum class TransportKind {
+    Tcp,
+    Ws,
+    Grpc
+};
+
+std::optional<VpnProtocol> protocolFromString(const QString &value);
+QString protocolToString(VpnProtocol protocol);
+
+QString transportToString(TransportKind kind);
+TransportKind transportFromString(const QString &value);
+
+/// Один узел из подписки.
+///
+/// tag стабилен между обновлениями подписки: он считается из параметров
+/// подключения, поэтому выбранный сервер и результаты url-теста не слетают.
+struct VpnNode {
+    QString tag;
+    VpnProtocol protocol = VpnProtocol::Vless;
+    QString name;
+    QString server;
+    int port = 0;
+
+    QString uuid;
+    QString password;
+    QString method;
+    QString flow;
+
+    TransportKind transport = TransportKind::Tcp;
+    QString path;
+    QString host;
+    QString serviceName;
+
+    bool tls = false;
+    QString sni;
+    std::optional<QStringList> alpn;   // <-- было QStringList
+    QString fingerprint;
+    bool allowInsecure = false;
+    bool reality = false;
+    QString publicKey;
+    QString shortId;
+
+    QString endpointLabel() const {
+        return QStringLiteral("%1:%2").arg(server).arg(port);
+    }
+
+    QJsonObject toJson() const;
+    static std::optional<VpnNode> fromJson(const QJsonObject &json);
+
+    /// Outbound sing-box. Поля подставляются только когда релевантны протоколу.
+    QJsonObject toOutbound() const;
+};
+</file>
+
+<file path="core/settings/app_settings.cpp">
+#include "app_settings.h"
+
+QJsonObject AppSettings::toJson() const
+{
+    QJsonObject o;
+    o[QStringLiteral("routingMode")] = routingModeToString(routingMode);
+    o[QStringLiteral("autoConnect")] = autoConnect;
+    if (localeCode.has_value())
+        o[QStringLiteral("localeCode")] = *localeCode;
+    if (selectedNodeTag.has_value())
+        o[QStringLiteral("selectedNodeTag")] = *selectedNodeTag;
+    o[QStringLiteral("killSwitch")] = killSwitch;
+    return o;
+}
+
+AppSettings AppSettings::fromJson(const QJsonObject &json)
+{
+    AppSettings s;
+    s.routingMode = routingModeFromString(
+        json.value(QStringLiteral("routingMode")).toString());
+    s.autoConnect = json.value(QStringLiteral("autoConnect")).toBool(false);
+
+    if (json.contains(QStringLiteral("localeCode")))
+        s.localeCode = json.value(QStringLiteral("localeCode")).toString();
+
+    if (json.contains(QStringLiteral("selectedNodeTag")))
+        s.selectedNodeTag = json.value(QStringLiteral("selectedNodeTag")).toString();
+
+    s.killSwitch = json.value(QStringLiteral("killSwitch")).toBool(false);
+    return s;
+}
+</file>
+
+<file path="core/settings/app_settings.h">
+#pragma once
+
+#include <QString>
+#include <QJsonObject>
+#include <optional>
+
+#include "../singbox/config_builder.h"
+
+/// Пользовательские настройки, которые переживают перезапуск.
+struct AppSettings {
+    RoutingMode routingMode = RoutingMode::Smart;
+    bool autoConnect = false;
+
+    /// nullopt — как в системе, иначе "ru" / "en".
+    std::optional<QString> localeCode;
+
+    std::optional<QString> selectedNodeTag;
+
+    /// Блокировать трафик мимо VPN (nftables, только в режиме TUN).
+    bool killSwitch = false;
+
+    QJsonObject toJson() const;
+    static AppSettings fromJson(const QJsonObject &json);
+};
+</file>
+
+<file path="core/singbox/config_builder.cpp">
+#include "config_builder.h"
+
+QString routingModeToString(RoutingMode mode)
+{
+    switch (mode) {
+    case RoutingMode::Smart:     return QStringLiteral("smart");
+    case RoutingMode::Global:    return QStringLiteral("global");
+    case RoutingMode::Whitelist: return QStringLiteral("whitelist");
+    }
+    return {};
+}
+
+RoutingMode routingModeFromString(const QString &value)
+{
+    if (value == QLatin1String("global"))    return RoutingMode::Global;
+    if (value == QLatin1String("whitelist")) return RoutingMode::Whitelist;
+    return RoutingMode::Smart;
+}
+
+// --- Сеттеры (fluent API) ---
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setNodes(QList<VpnNode> nodes)
+{ m_nodes = std::move(nodes); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setSelectedTag(QString tag)
+{ m_selectedTag = std::move(tag); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setMode(RoutingMode mode)
+{ m_mode = mode; return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setClashApiPort(int port)
+{ m_clashApiPort = port; return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setClashApiSecret(QString secret)
+{ m_clashApiSecret = std::move(secret); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setTunInterfaceName(QString name)
+{ m_tunInterfaceName = std::move(name); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setTunAddress(QString address)
+{ m_tunAddress = std::move(address); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setTunStack(QString stack)
+{ m_tunStack = std::move(stack); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setRuleSetBaseUrl(QString url)
+{ m_ruleSetBaseUrl = std::move(url); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setLogLevel(QString level)
+{ m_logLevel = std::move(level); return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setMixedPort(std::optional<int> port)
+{ m_mixedPort = port; return *this; }
+
+SingBoxConfigBuilder &SingBoxConfigBuilder::setRuleSetDirectory(std::optional<QString> dir)
+{ m_ruleSetDirectory = std::move(dir); return *this; }
+
+// --- build ---
+
+QJsonObject SingBoxConfigBuilder::build() const
+{
+    QStringList tags;
+    tags.reserve(m_nodes.size());
+    for (const auto &node : m_nodes)
+        tags.append(node.tag);
+
+    QJsonObject log;
+    log[QStringLiteral("level")]     = m_logLevel;
+    log[QStringLiteral("timestamp")] = true;
+
+    QJsonArray outbounds;
+    for (const auto &node : m_nodes)
+        outbounds.append(node.toOutbound());
+
+    {
+        QJsonObject direct;
+        direct[QStringLiteral("type")] = QStringLiteral("direct");
+        direct[QStringLiteral("tag")]  = QStringLiteral("direct");
+        outbounds.append(direct);
+    }
+    {
+        QJsonObject block;
+        block[QStringLiteral("type")] = QStringLiteral("block");
+        block[QStringLiteral("tag")]  = QStringLiteral("block");
+        outbounds.append(block);
+    }
+    outbounds.append(buildSelector(tags));
+    outbounds.append(buildUrlTest(tags));
+
+    QJsonArray inbounds;
+    if (m_mixedPort.has_value())
+        inbounds.append(buildMixedInbound(*m_mixedPort));
+    else
+        inbounds.append(buildTunInbound());
+
+    QJsonObject result;
+    result[QStringLiteral("log")]          = log;
+    result[QStringLiteral("dns")]          = buildDns();
+    result[QStringLiteral("inbounds")]     = inbounds;
+    result[QStringLiteral("outbounds")]    = outbounds;
+    result[QStringLiteral("route")]        = buildRoute(tags);
+    result[QStringLiteral("experimental")] = buildExperimental();
+    return result;
+}
+
+QJsonObject SingBoxConfigBuilder::buildDns() const
+{
+    // Формат DNS-серверов sing-box 1.12+: legacy `address` удалён в 1.14.
+    QJsonObject directDns;
+    directDns[QStringLiteral("type")]   = QStringLiteral("https");
+    directDns[QStringLiteral("tag")]    = QStringLiteral("dns-direct");
+    directDns[QStringLiteral("server")] = QStringLiteral("77.88.8.8");
+    directDns[QStringLiteral("path")]   = QStringLiteral("/dns-query");
+
+    QJsonObject remoteDns;
+    remoteDns[QStringLiteral("type")]   = QStringLiteral("https");
+    remoteDns[QStringLiteral("tag")]    = QStringLiteral("dns-remote");
+    remoteDns[QStringLiteral("server")] = QStringLiteral("1.1.1.1");
+    remoteDns[QStringLiteral("path")]   = QStringLiteral("/dns-query");
+    remoteDns[QStringLiteral("detour")] = QStringLiteral("proxy");
+
+    QJsonArray rules;
+    if (m_mode != RoutingMode::Global) {
+        QJsonObject rule;
+        rule[QStringLiteral("rule_set")] = QJsonArray{QStringLiteral("geosite-ru")};
+        rule[QStringLiteral("server")]   = QStringLiteral("dns-direct");
+        rules.append(rule);
+    }
+
+    QJsonObject result;
+    result[QStringLiteral("servers")] = QJsonArray{directDns, remoteDns};
+    result[QStringLiteral("rules")]   = rules;
+    result[QStringLiteral("final")]   = QStringLiteral("dns-remote");
+    return result;
+}
+
+QJsonObject SingBoxConfigBuilder::buildTunInbound() const
+{
+    QJsonObject o;
+    o[QStringLiteral("type")]           = QStringLiteral("tun");
+    o[QStringLiteral("tag")]            = QStringLiteral("tun-in");
+    o[QStringLiteral("interface_name")] = m_tunInterfaceName;
+    o[QStringLiteral("address")]        = QJsonArray{m_tunAddress};
+    o[QStringLiteral("mtu")]            = 9000;
+    o[QStringLiteral("auto_route")]     = true;
+    o[QStringLiteral("strict_route")]   = true;
+    o[QStringLiteral("stack")]          = m_tunStack;
+    return o;
+}
+
+QJsonObject SingBoxConfigBuilder::buildMixedInbound(int port) const
+{
+    QJsonObject o;
+    o[QStringLiteral("type")]        = QStringLiteral("mixed");
+    o[QStringLiteral("tag")]         = QStringLiteral("mixed-in");
+    o[QStringLiteral("listen")]      = QStringLiteral("127.0.0.1");
+    o[QStringLiteral("listen_port")] = port;
+    return o;
+}
+
+QJsonObject SingBoxConfigBuilder::buildSelector(const QStringList &tags) const
+{
+    QJsonArray outbounds;
+    outbounds.append(QStringLiteral("urltest"));
+    for (const auto &tag : tags)
+        outbounds.append(tag);
+
+    QJsonObject o;
+    o[QStringLiteral("type")]      = QStringLiteral("selector");
+    o[QStringLiteral("tag")]       = QStringLiteral("proxy");
+    o[QStringLiteral("outbounds")] = outbounds;
+    o[QStringLiteral("default")]   = QStringLiteral("urltest");
+    return o;
+}
+
+QJsonObject SingBoxConfigBuilder::buildUrlTest(const QStringList &tags) const
+{
+    QJsonArray outbounds;
+    for (const auto &tag : tags)
+        outbounds.append(tag);
+
+    QJsonObject o;
+    o[QStringLiteral("type")]      = QStringLiteral("urltest");
+    o[QStringLiteral("tag")]       = QStringLiteral("urltest");
+    o[QStringLiteral("outbounds")] = outbounds;
+    o[QStringLiteral("url")]       = QStringLiteral("https://www.gstatic.com/generate_204");
+    o[QStringLiteral("interval")]  = QStringLiteral("3m");
+    o[QStringLiteral("tolerance")] = 50;
+    return o;
+}
+
+QJsonObject SingBoxConfigBuilder::buildRoute(const QStringList &tags) const
+{
+    QJsonArray rules;
+    {
+        QJsonObject sniff;
+        sniff[QStringLiteral("action")] = QStringLiteral("sniff");
+        rules.append(sniff);
+    }
+    {
+        QJsonObject dns;
+        dns[QStringLiteral("protocol")] = QStringLiteral("dns");
+        dns[QStringLiteral("action")]   = QStringLiteral("hijack-dns");
+        rules.append(dns);
+    }
+
+    if (m_mode == RoutingMode::Smart) {
+        {
+            QJsonObject priv;
+            priv[QStringLiteral("ip_is_private")] = true;
+            priv[QStringLiteral("outbound")]      = QStringLiteral("direct");
+            rules.append(priv);
+        }
+        {
+            QJsonObject geoip;
+            geoip[QStringLiteral("rule_set")] = QJsonArray{QStringLiteral("geoip-ru")};
+            geoip[QStringLiteral("outbound")] = QStringLiteral("direct");
+            rules.append(geoip);
+        }
+        {
+            QJsonObject geosite;
+            geosite[QStringLiteral("rule_set")] = QJsonArray{QStringLiteral("geosite-ru")};
+            geosite[QStringLiteral("outbound")] = QStringLiteral("direct");
+            rules.append(geosite);
+        }
+    } else if (m_mode == RoutingMode::Whitelist) {
+        QJsonObject priv;
+        priv[QStringLiteral("ip_is_private")] = true;
+        priv[QStringLiteral("outbound")]      = QStringLiteral("direct");
+        rules.append(priv);
+    }
+
+    QJsonObject o;
+    o[QStringLiteral("rules")] = rules;
+    if (m_mode == RoutingMode::Global)
+        o[QStringLiteral("rule_set")] = QJsonArray();
+    else
+        o[QStringLiteral("rule_set")] = buildRuleSets();
+    o[QStringLiteral("final")] =
+        (m_mode == RoutingMode::Whitelist)
+            ? QStringLiteral("direct")
+            : QStringLiteral("proxy");
+    o[QStringLiteral("default_domain_resolver")] = QStringLiteral("dns-direct");
+    o[QStringLiteral("auto_detect_interface")]   = true;
+    return o;
+}
+
+QJsonArray SingBoxConfigBuilder::buildRuleSets() const
+{
+    QJsonArray arr;
+
+    if (m_ruleSetDirectory.has_value()) {
+        const QString dir = *m_ruleSetDirectory;
+
+        auto makeLocal = [&](const QString &tag, const QString &file) {
+            QJsonObject o;
+            o[QStringLiteral("type")]   = QStringLiteral("local");
+            o[QStringLiteral("tag")]    = tag;
+            o[QStringLiteral("format")] = QStringLiteral("binary");
+            o[QStringLiteral("path")]   = QStringLiteral("%1/%2").arg(dir, file);
+            return o;
+        };
+
+        arr.append(makeLocal(QStringLiteral("geosite-ru"),
+                             QStringLiteral("geosite-category-ru.srs")));
+        arr.append(makeLocal(QStringLiteral("geoip-ru"),
+                             QStringLiteral("geoip-ru.srs")));
+        return arr;
+    }
+
+    auto makeRemote = [&](const QString &tag, const QString &file) {
+        QJsonObject o;
+        o[QStringLiteral("type")]            = QStringLiteral("remote");
+        o[QStringLiteral("tag")]             = tag;
+        o[QStringLiteral("format")]          = QStringLiteral("binary");
+        o[QStringLiteral("url")]             =
+            QStringLiteral("%1/%2").arg(m_ruleSetBaseUrl, file);
+        o[QStringLiteral("download_detour")] = QStringLiteral("direct");
+        o[QStringLiteral("update_interval")] = QStringLiteral("1d");
+        return o;
+    };
+
+    arr.append(makeRemote(QStringLiteral("geosite-ru"),
+                          QStringLiteral("geosite-category-ru.srs")));
+    arr.append(makeRemote(QStringLiteral("geoip-ru"),
+                          QStringLiteral("geoip-ru.srs")));
+    return arr;
+}
+
+QJsonObject SingBoxConfigBuilder::buildExperimental() const
+{
+    QJsonObject api;
+    api[QStringLiteral("external_controller")] =
+        QStringLiteral("127.0.0.1:%1").arg(m_clashApiPort);
+    api[QStringLiteral("secret")] = m_clashApiSecret;
+
+    QJsonObject cache;
+    cache[QStringLiteral("enabled")] = true;
+
+    QJsonObject o;
+    o[QStringLiteral("clash_api")] = api;
+    o[QStringLiteral("cache_file")] = cache;
+    return o;
+}
+</file>
+
+<file path="core/singbox/config_builder.h">
+#pragma once
+
+#include <QString>
+#include <QStringList>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QList>
+
+#include "../model/vpn_node.h"
+
+/// Режим маршрутизации.
+enum class RoutingMode {
+    Smart,      // RU и приватные сети — напрямую, остальное — через VPN
+    Global,     // весь трафик через VPN
+    Whitelist   // всё напрямую, через VPN — только явно перечисленные
+};
+
+QString routingModeToString(RoutingMode mode);
+RoutingMode routingModeFromString(const QString &value);
+
+/// Собирает JSON-конфиг sing-box из узлов и настроек.
+///
+/// Один и тот же конфиг уходит и в libbox на Android, и в сайдкар на десктопе.
+class SingBoxConfigBuilder {
+public:
+    static constexpr const char *defaultRuleSetBaseUrl =
+        "https://github.com/clgvpn/rulesets/releases/latest/download";
+
+    SingBoxConfigBuilder() = default;
+
+    SingBoxConfigBuilder &setNodes(QList<VpnNode> nodes);
+    SingBoxConfigBuilder &setSelectedTag(QString tag);
+    SingBoxConfigBuilder &setMode(RoutingMode mode);
+    SingBoxConfigBuilder &setClashApiPort(int port);
+    SingBoxConfigBuilder &setClashApiSecret(QString secret);
+    SingBoxConfigBuilder &setTunInterfaceName(QString name);
+    SingBoxConfigBuilder &setTunAddress(QString address);
+    SingBoxConfigBuilder &setTunStack(QString stack);
+    SingBoxConfigBuilder &setRuleSetBaseUrl(QString url);
+    SingBoxConfigBuilder &setLogLevel(QString level);
+    SingBoxConfigBuilder &setMixedPort(std::optional<int> port);
+    SingBoxConfigBuilder &setRuleSetDirectory(std::optional<QString> dir);
+
+    QJsonObject build() const;
+
+private:
+    QJsonObject buildDns() const;
+    QJsonObject buildTunInbound() const;
+    QJsonObject buildMixedInbound(int port) const;
+    QJsonObject buildSelector(const QStringList &tags) const;
+    QJsonObject buildUrlTest(const QStringList &tags) const;
+    QJsonObject buildRoute(const QStringList &tags) const;
+    QJsonArray buildRuleSets() const;
+    QJsonObject buildExperimental() const;
+
+    QList<VpnNode> m_nodes;
+    QString m_selectedTag;
+    RoutingMode m_mode = RoutingMode::Smart;
+    int m_clashApiPort = 9090;
+    QString m_clashApiSecret;
+    QString m_tunInterfaceName = QStringLiteral("clgvpn0");
+    QString m_tunAddress = QStringLiteral("172.19.0.1/30");
+    QString m_tunStack = QStringLiteral("gvisor");
+    QString m_ruleSetBaseUrl = QString::fromLatin1(defaultRuleSetBaseUrl);
+    QString m_logLevel = QStringLiteral("warn");
+    std::optional<int> m_mixedPort;
+    std::optional<QString> m_ruleSetDirectory;
+};
+</file>
+
+<file path="core/storage/app_paths.cpp">
+#include "app_paths.h"
+
+#include <QStandardPaths>
+#include <QDir>
+
+QString appSupportDir()
+{
+    const QString base = QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation);
+    return QDir(base).filePath(QStringLiteral("core"));
+}
+
+QString ensureAppSupportDir()
+{
+    const QString path = appSupportDir();
+    if (QDir().mkpath(path))
+        return path;
+    return {};
+}
+</file>
+
+<file path="core/storage/app_paths.h">
+#pragma once
+
+#include <QString>
+
+/// Каталог приложения для конфигов, кэша ядра и подписок.
+///
+/// Аналог appSupportDirProvider из Flutter-версии:
+/// Linux:   ~/.local/share/clgvpn/core
+/// Windows: %APPDATA%/clgvpn/core
+QString appSupportDir();
+
+/// Гарантирует существование каталога (создаёт рекурсивно).
+/// Возвращает путь или пустую строку, если создать не удалось.
+QString ensureAppSupportDir();
+</file>
+
+<file path="core/storage/settings_store.cpp">
+#include "settings_store.h"
+
+#include <QFile>
+#include <QDir>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+
+SettingsStore::SettingsStore(QString filePath)
+    : m_filePath(std::move(filePath)) {}
+
+AppSettings SettingsStore::load() const
+{
+    QFile file(m_filePath);
+    if (!file.exists())
+        return AppSettings{};
+
+    if (!file.open(QIODevice::ReadOnly))
+        return AppSettings{};
+
+    QJsonParseError err{};
+    const auto doc = QJsonDocument::fromJson(file.readAll(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
+        return AppSettings{};
+
+    return AppSettings::fromJson(doc.object());
+}
+
+bool SettingsStore::save(const AppSettings &settings) const
+{
+    QDir().mkpath(QFileInfo(m_filePath).absolutePath());
+
+    QFile file(m_filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    const QJsonDocument doc(settings.toJson());
+    file.write(doc.toJson(QJsonDocument::Indented));
+    return true;
+}
+</file>
+
+<file path="core/storage/settings_store.h">
+#pragma once
+
+#include <QString>
+#include "../settings/app_settings.h"
+
+/// Настройки в JSON-файле рядом с подписками.
+class SettingsStore {
+public:
+    explicit SettingsStore(QString filePath);
+
+    AppSettings load() const;
+    bool save(const AppSettings &settings) const;
+
+    QString filePath() const { return m_filePath; }
+
+private:
+    QString m_filePath;
+};
+</file>
+
+<file path="core/storage/subscription_store.cpp">
+#include "subscription_store.h"
+
+#include <QFile>
+#include <QDir>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonParseError>
+
+SubscriptionStore::SubscriptionStore(QString filePath)
+    : m_filePath(std::move(filePath)) {}
+
+QList<Subscription> SubscriptionStore::load() const
+{
+    QFile file(m_filePath);
+    if (!file.exists())
+        return {};
+
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+
+    QJsonParseError err{};
+    const auto doc = QJsonDocument::fromJson(file.readAll(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
+        return {};
+
+    const auto items = doc.object().value(QStringLiteral("subscriptions"));
+    if (!items.isArray())
+        return {};
+
+    QList<Subscription> result;
+    for (const auto &v : items.toArray()) {
+        if (!v.isObject()) continue;
+        const auto sub = Subscription::fromJson(v.toObject());
+        if (sub.has_value())
+            result.append(*sub);
+    }
+    return result;
+}
+
+bool SubscriptionStore::save(const QList<Subscription> &subscriptions) const
+{
+    QDir().mkpath(QFileInfo(m_filePath).absolutePath());
+
+    QJsonArray arr;
+    for (const auto &s : subscriptions)
+        arr.append(s.toJson());
+
+    QJsonObject root;
+    root[QStringLiteral("version")]       = 1;
+    root[QStringLiteral("subscriptions")] = arr;
+
+    QFile file(m_filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    return true;
+}
+</file>
+
+<file path="core/storage/subscription_store.h">
+#pragma once
+
+#include <QString>
+#include <QList>
+#include "../subscription/subscription.h"
+
+/// Хранит подписки в JSON-файле рядом с настройками приложения.
+///
+/// Формат совпадает с Flutter-версией:
+/// { "version": 1, "subscriptions": [ ... ] }
+class SubscriptionStore {
+public:
+    explicit SubscriptionStore(QString filePath);
+
+    QList<Subscription> load() const;
+    bool save(const QList<Subscription> &subscriptions) const;
+
+    QString filePath() const { return m_filePath; }
+
+private:
+    QString m_filePath;
+};
+</file>
+
+<file path="core/subscription/auto_refresh.cpp">
+#include "auto_refresh.h"
+#include "subscription_manager.h"
+
+bool isDueForRefresh(const Subscription &subscription, const QDateTime &now)
+{
+    return subscription.updatedAt.secsTo(now)
+           >= static_cast<qint64>(subscription.updateIntervalMinutes) * 60;
+}
+
+SubscriptionAutoRefresh::SubscriptionAutoRefresh(SubscriptionsManager *manager,
+                                                 QObject *parent)
+    : QObject(parent)
+    , m_manager(manager)
+{
+    m_timer.setInterval(5 * 60 * 1000);   // 5 минут
+    connect(&m_timer, &QTimer::timeout, this, &SubscriptionAutoRefresh::check);
+}
+
+void SubscriptionAutoRefresh::start()
+{
+    m_timer.start();
+    check();
+}
+
+void SubscriptionAutoRefresh::stop()
+{
+    m_timer.stop();
+}
+
+void SubscriptionAutoRefresh::check()
+{
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    for (const auto &sub : m_manager->subscriptions()) {
+        if (!isDueForRefresh(sub, now)) continue;
+        m_manager->refresh(sub.id);
+    }
+}
+</file>
+
+<file path="core/subscription/auto_refresh.h">
+#pragma once
+
+#include <QObject>
+#include <QTimer>
+
+#include "subscription.h"
+
+class SubscriptionsManager;
+
+/// Пора ли обновлять подписку: с последнего обновления прошёл её интервал.
+bool isDueForRefresh(const Subscription &subscription, const QDateTime &now);
+/// Фоновое обновление подписок.
+///
+/// Проверяет расписание раз в checkEvery; упавшая подписка не мешает остальным
+/// и не стирает уже загруженные узлы.
+class SubscriptionAutoRefresh : public QObject {
+    Q_OBJECT
+
+public:
+    explicit SubscriptionAutoRefresh(SubscriptionsManager *manager,
+                                     QObject *parent = nullptr);
+
+    void start();
+    void stop();
+
+private:
+    void check();
+
+    SubscriptionsManager *m_manager;
+    QTimer m_timer;
+};
+</file>
+
+<file path="core/subscription/link_parser.cpp">
+#include "link_parser.h"
+#include "../util/base64.h"
+#include "../util/stable_hash.h"
+
+#include <QUrl>
+#include <QUrlQuery>
+#include <QRegularExpression>
+#include <stdexcept>
+
+namespace {
+
+[[noreturn]] void fail(const QString &message)
+{
+    throw std::invalid_argument(message.toStdString());
+}
+
+QString tagFor(VpnProtocol protocol, const QString &server, int port,
+               const QString &secret, const QStringList &extra)
+{
+    QStringList parts;
+    parts << protocolToString(protocol)
+          << server
+          << QString::number(port)
+          << secret
+          << extra;
+    return QStringLiteral("n-") + stableHash32(parts.join(QLatin1Char('|')));
+}
+
+TransportKind transportFor(const QString &network)
+{
+    if (network == QLatin1String("ws"))   return TransportKind::Ws;
+    if (network == QLatin1String("grpc")) return TransportKind::Grpc;
+    return TransportKind::Tcp;
+}
+
+std::optional<QStringList> splitAlpn(const QString &value)
+{
+    if (value.isEmpty()) return std::nullopt;
+    QStringList list;
+    for (const auto &part : value.split(QLatin1Char(','))) {
+        const QString trimmed = part.trimmed();
+        if (!trimmed.isEmpty()) list.append(trimmed);
+    }
+    return list.isEmpty() ? std::nullopt : std::optional<QStringList>(list);
+}
+
+QString displayName(const QUrl &url, const QString &fallback)
+{
+    const QString fragment = QUrl::fromPercentEncoding(url.fragment().toUtf8());
+    return fragment.isEmpty() ? fallback : fragment;
+}
+
+std::pair<QString, int> endpointFromUrl(const QUrl &url)
+{
+    const QString host = url.host();
+    const int port = url.port(443);
+    if (host.isEmpty()) fail(QStringLiteral("В ссылке нет адреса сервера"));
+    if (port <= 0 || port > 65535) fail(QStringLiteral("Некорректный порт"));
+    return {host, port};
+}
+
+VpnNode parseVless(const QUrl &url)
+{
+    const QString uuid = url.userInfo();
+    if (uuid.isEmpty()) fail(QStringLiteral("Во vless-ссылке нет uuid"));
+
+    const auto [server, port] = endpointFromUrl(url);
+    const QUrlQuery query(url);
+    auto param = [&](const char *key) { return query.queryItemValue(QLatin1String(key)); };
+
+    const QString security = param("security").isEmpty()
+                                 ? QStringLiteral("none")
+                                 : param("security");
+    const QString network = param("type").isEmpty()
+                                ? QStringLiteral("tcp")
+                                : param("type");
+    const QString sni = param("sni");
+    const QString host = param("host");
+    const QString path = param("path");
+
+    VpnNode n;
+    n.tag = tagFor(VpnProtocol::Vless, server, port, uuid,
+                   {network, path, sni, param("pbk"), param("sid")});
+    n.protocol = VpnProtocol::Vless;
+    n.name = displayName(url, QStringLiteral("%1:%2").arg(server).arg(port));
+    n.server = server;
+    n.port = port;
+    n.uuid = uuid;
+    n.flow = param("flow");
+    n.transport = transportFor(network);
+    n.path = path;
+    n.host = host;
+    n.serviceName = param("serviceName");
+    n.tls = (security == QLatin1String("tls") || security == QLatin1String("reality"));
+    n.sni = sni;
+    n.alpn = splitAlpn(param("alpn"));
+    n.fingerprint = param("fp");
+    n.allowInsecure = (param("allowInsecure") == QLatin1String("1"));
+    n.reality = (security == QLatin1String("reality"));
+    n.publicKey = param("pbk");
+    n.shortId = param("sid");
+    return n;
+}
+
+VpnNode parseTrojan(const QUrl &url)
+{
+    const QString password = url.userInfo();
+    if (password.isEmpty()) fail(QStringLiteral("Во trojan-ссылке нет пароля"));
+
+    const auto [server, port] = endpointFromUrl(url);
+    const QUrlQuery query(url);
+    auto param = [&](const char *key) { return query.queryItemValue(QLatin1String(key)); };
+
+    const QString network = param("type").isEmpty()
+                                ? QStringLiteral("tcp")
+                                : param("type");
+
+    VpnNode n;
+    n.tag = tagFor(VpnProtocol::Trojan, server, port, password,
+                   {network, param("path"), param("sni")});
+    n.protocol = VpnProtocol::Trojan;
+    n.name = displayName(url, QStringLiteral("%1:%2").arg(server).arg(port));
+    n.server = server;
+    n.port = port;
+    n.password = password;
+    n.transport = transportFor(network);
+    n.path = param("path");
+    n.host = param("host");
+    n.serviceName = param("serviceName");
+    n.tls = true;
+    n.sni = param("sni");
+    n.alpn = splitAlpn(param("alpn"));
+    n.fingerprint = param("fp");
+    n.allowInsecure = (param("allowInsecure") == QLatin1String("1"));
+    return n;
+}
+
+// Uri.parse приводит host к нижнему регистру и ломает base64, поэтому ss разбираем вручную.
+VpnNode parseShadowsocks(const QString &link)
+{
+    const int schemeEnd = link.indexOf(QStringLiteral("://"));
+    if (schemeEnd < 0) fail(QStringLiteral("Не удалось разобрать ss-ссылку"));
+    QString body = link.mid(schemeEnd + 3);
+
+    QString fragment;
+    const int hashAt = body.indexOf(QLatin1Char('#'));
+    if (hashAt >= 0) {
+        fragment = body.mid(hashAt + 1);
+        body = body.left(hashAt);
+    }
+
+    QString authority = body;
+    const int queryAt = body.indexOf(QLatin1Char('?'));
+    if (queryAt >= 0)
+        authority = body.left(queryAt);
+
+    QString server;
+    int port = 0;
+    QString credentials;
+
+    if (authority.contains(QLatin1Char('@'))) {
+        const int at = authority.lastIndexOf(QLatin1Char('@'));
+        const QString userInfo = authority.left(at);
+        const QString hostPort = authority.mid(at + 1);
+
+        const auto decoded = tryDecodeBase64(userInfo);
+        credentials = decoded.has_value() ? *decoded : userInfo;
+
+        const int bracket = hostPort.lastIndexOf(QLatin1Char(']'));
+        const int colon = hostPort.lastIndexOf(QLatin1Char(':'));
+        if (colon <= bracket) fail(QStringLiteral("В ss-ссылке нет порта"));
+        server = hostPort.left(colon);
+        port = hostPort.mid(colon + 1).toInt();
+    } else {
+        const auto decoded = tryDecodeBase64(authority);
+        if (!decoded.has_value() || !decoded->contains(QLatin1Char('@')))
+            fail(QStringLiteral("Не удалось разобрать ss-ссылку"));
+
+        const int at = decoded->lastIndexOf(QLatin1Char('@'));
+        credentials = decoded->left(at);
+        const QString hostPort = decoded->mid(at + 1);
+
+        const int bracket = hostPort.lastIndexOf(QLatin1Char(']'));
+        const int colon = hostPort.lastIndexOf(QLatin1Char(':'));
+        if (colon <= bracket) fail(QStringLiteral("В ss-ссылке нет порта"));
+        server = hostPort.left(colon);
+        port = hostPort.mid(colon + 1).toInt();
+    }
+
+    if (port <= 0 || port > 65535) fail(QStringLiteral("Некорректный порт"));
+
+    const int sep = credentials.indexOf(QLatin1Char(':'));
+    if (sep <= 0 || sep == credentials.size() - 1)
+        fail(QStringLiteral("Ожидается method:password в ss-ссылке"));
+
+    const QString method = credentials.left(sep);
+    const QString password = credentials.mid(sep + 1);
+
+    VpnNode n;
+    n.tag = tagFor(VpnProtocol::Shadowsocks, server, port, password, {method});
+    n.protocol = VpnProtocol::Shadowsocks;
+    n.name = fragment.isEmpty()
+                 ? QStringLiteral("%1:%2").arg(server).arg(port)
+                 : QUrl::fromPercentEncoding(fragment.toUtf8());
+    n.server = server;
+    n.port = port;
+    n.method = method;
+    n.password = password;
+    return n;
+}
+
+} // namespace
+
+std::optional<VpnNode> parseLink(const QString &rawLink)
+{
+    const QString link = rawLink.trimmed();
+    if (link.isEmpty()) return std::nullopt;
+
+    const int schemeEnd = link.indexOf(QStringLiteral("://"));
+    if (schemeEnd < 0) return std::nullopt;
+
+    const QString scheme = link.left(schemeEnd).toLower();
+    if (scheme == QLatin1String("ss"))
+        return parseShadowsocks(link);
+
+    const QUrl url(link, QUrl::StrictMode);
+    if (!url.isValid()) fail(QStringLiteral("Некорректная ссылка"));
+
+    if (scheme == QLatin1String("vless"))  return parseVless(url);
+    if (scheme == QLatin1String("trojan")) return parseTrojan(url);
+    return std::nullopt;
+}
+</file>
+
+<file path="core/subscription/link_parser.h">
+#pragma once
+
+#include <QString>
+#include <optional>
+#include "../model/vpn_node.h"
+
+/// Разбор пользовательских ссылок вида vless://…, trojan://…, ss://…
+///
+/// Возвращает nullopt для неизвестных схем.
+/// Для известных, но битых ссылок — выбрасывает std::runtime_error
+/// с сообщением, пригодным для показа пользователю.
+std::optional<VpnNode> parseLink(const QString &rawLink);
+</file>
+
+<file path="core/subscription/subscription_manager.cpp">
+#include "subscription_manager.h"
+#include "subscription_service.h"
+#include "../storage/subscription_store.h"
+
+SubscriptionsManager::SubscriptionsManager(SubscriptionService *service,
+                                           SubscriptionStore *store,
+                                           QObject *parent)
+    : QObject(parent)
+    , m_service(service)
+    , m_store(store)
+{
+    connect(m_service, &SubscriptionService::finished,
+            this, [this](const Subscription &sub) {
+                // add() и refresh() различаются: для add() заменяем по id,
+                // для refresh() — тоже. Логика одна.
+                QList<Subscription> next = m_subscriptions;
+                bool replaced = false;
+                for (auto &item : next) {
+                    if (item.id == sub.id) { item = sub; replaced = true; break; }
+                }
+                if (!replaced) next.append(sub);
+                replaceAll(next);
+                if (!replaced) emit subscriptionAdded(sub);
+            });
+
+    connect(m_service, &SubscriptionService::failed,
+            this, &SubscriptionsManager::errorOccurred);
+}
+
+void SubscriptionsManager::loadFromStore()
+{
+    m_subscriptions = m_store->load();
+    emit subscriptionsChanged();
+}
+
+void SubscriptionsManager::add(const QString &url)
+{
+    m_service->fetch(url);
+}
+
+void SubscriptionsManager::refresh(const QString &id)
+{
+    const auto *existing = findById(id);
+    if (!existing) return;
+    m_service->fetch(existing->url);
+}
+
+void SubscriptionsManager::remove(const QString &id)
+{
+    QList<Subscription> next;
+    for (const auto &s : m_subscriptions)
+        if (s.id != id) next.append(s);
+    replaceAll(next);
+}
+
+const Subscription *SubscriptionsManager::findById(const QString &id) const
+{
+    for (const auto &s : m_subscriptions)
+        if (s.id == id) return &s;
+    return nullptr;
+}
+
+QList<VpnNode> SubscriptionsManager::allNodes() const
+{
+    QList<VpnNode> result;
+    for (const auto &s : m_subscriptions)
+        result.append(s.nodes);
+    return result;
+}
+
+void SubscriptionsManager::replaceAll(const QList<Subscription> &next)
+{
+    m_subscriptions = next;
+    persist();
+    emit subscriptionsChanged();
+}
+
+void SubscriptionsManager::persist()
+{
+    m_store->save(m_subscriptions);
+}
+</file>
+
+<file path="core/subscription/subscription_manager.h">
+#pragma once
+
+#include <QObject>
+#include <QList>
+#include "subscription.h"
+
+class SubscriptionService;
+class SubscriptionStore;
+
+/// Менеджер подписок: загрузка с диска, добавление, обновление, удаление.
+/// Заменяет SubscriptionsNotifier из Flutter-версии.
+class SubscriptionsManager : public QObject {
+    Q_OBJECT
+
+public:
+    SubscriptionsManager(SubscriptionService *service,
+                         SubscriptionStore *store,
+                         QObject *parent = nullptr);
+
+    const QList<Subscription> &subscriptions() const { return m_subscriptions; }
+
+    void loadFromStore();
+
+    /// Асинхронно. При успехе — сигналы subscriptionAdded/subscriptionsChanged.
+    void add(const QString &url);
+
+    /// Асинхронно. При успехе — subscriptionsChanged.
+    void refresh(const QString &id);
+
+    void remove(const QString &id);
+
+    const Subscription *findById(const QString &id) const;
+    QList<VpnNode> allNodes() const;
+
+signals:
+    void subscriptionsChanged();
+    void subscriptionAdded(const Subscription &subscription);
+    void errorOccurred(const QString &message);
+
+private:
+    void replaceAll(const QList<Subscription> &next);
+    void persist();
+
+    SubscriptionService *m_service;
+    SubscriptionStore *m_store;
+    QList<Subscription> m_subscriptions;
+};
+</file>
+
+<file path="core/subscription/subscription_parser.cpp">
+#include "subscription_parser.h"
+#include "../util/base64.h"
+#include "link_parser.h"
+
+#include <QRegularExpression>
+#include <QJsonDocument>
+#include <stdexcept>
+
+#include <QTimeZone>
+
+namespace {
+
+[[noreturn]] void fail(const QString &message)
+{
+    throw std::invalid_argument(message.toStdString());
+}
+
+QString decodeTitle(const QString &raw)
+{
+    if (raw.isEmpty()) return {};
+    if (!raw.startsWith(QLatin1String("base64:")))
+        return raw;
+    const auto decoded = tryDecodeBase64(raw.mid(7).trimmed());
+    return decoded.value_or(QString());
+}
+
+std::optional<SubscriptionTraffic> parseUserInfo(const QString &raw)
+{
+    if (raw.trimmed().isEmpty()) return std::nullopt;
+
+    QMap<QString, qint64> values;
+    QRegularExpression re(QStringLiteral(R"((\w+)\s*=\s*(-?\d+))"));
+    auto it = re.globalMatch(raw);
+    while (it.hasNext()) {
+        const auto m = it.next();
+        values[m.captured(1)] = m.captured(2).toLongLong();
+    }
+    if (values.isEmpty()) return std::nullopt;
+
+    SubscriptionTraffic t;
+    t.upload   = values.value(QStringLiteral("upload"), 0);
+    t.download = values.value(QStringLiteral("download"), 0);
+    t.total    = values.value(QStringLiteral("total"), 0);
+
+    const qint64 expire = values.value(QStringLiteral("expire"), 0);
+    if (expire > 0)
+        t.expire = QDateTime::fromSecsSinceEpoch(expire, QTimeZone::UTC);
+
+    return t;
+}
+
+std::optional<int> parseInterval(const QString &raw)
+{
+    bool ok = false;
+    const int hours = raw.trimmed().toInt(&ok);
+    if (!ok || hours <= 0) return std::nullopt;
+    return hours;
+}
+
+} // namespace
+
+SubscriptionMeta SubscriptionMeta::parse(const QMap<QString, QString> &headers)
+{
+    // Приводим ключи к нижнему регистру, как в Dart.
+    QMap<QString, QString> lower;
+    for (auto it = headers.constBegin(); it != headers.constEnd(); ++it)
+        lower.insert(it.key().toLower(), it.value());
+
+    SubscriptionMeta meta;
+
+    const QString title = decodeTitle(lower.value(QStringLiteral("profile-title")));
+    if (!title.isEmpty()) meta.title = title;
+
+    meta.traffic = parseUserInfo(lower.value(QStringLiteral("subscription-userinfo")));
+    meta.updateIntervalHours = parseInterval(lower.value(QStringLiteral("profile-update-interval")));
+    return meta;
+}
+
+QList<VpnNode> parseSubscriptionBody(const QString &raw)
+{
+    const QString trimmed = raw.trimmed();
+    if (trimmed.isEmpty()) return {};
+
+    if (trimmed.startsWith(QLatin1Char('{')) || trimmed.startsWith(QLatin1Char('[')))
+        fail(QStringLiteral("JSON-подписки пока не поддерживаются — "
+                            "включите в панели обычный формат ссылок"));
+
+    const QString text = trimmed.contains(QLatin1String("://"))
+                             ? trimmed
+                             : tryDecodeBase64(trimmed).value_or(QString());
+
+    QList<VpnNode> nodes;
+    QSet<QString> seen;
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\r\n]+")),
+                                        Qt::SkipEmptyParts);
+    for (const auto &line : lines) {
+        const QString link = line.trimmed();
+        if (link.isEmpty() || !link.contains(QLatin1String("://"))) continue;
+        try {
+            const auto node = parseLink(link);
+            if (!node.has_value()) continue;
+            if (!seen.contains(node->tag)) {
+                seen.insert(node->tag);
+                nodes.append(*node);
+            }
+        } catch (const std::invalid_argument &) {
+            // битую строку пропускаем: остальные узлы важнее
+        }
+    }
+    return nodes;
+}
+</file>
+
+<file path="core/subscription/subscription_parser.h">
+#pragma once
+
+#include <QString>
+#include <QList>
+#include <QMap>
+#include <optional>
+#include "../model/vpn_node.h"
+#include "subscription.h"
+
+/// Метаданные, которые панель отдаёт заголовками.
+struct SubscriptionMeta {
+    std::optional<QString> title;
+    std::optional<SubscriptionTraffic> traffic;
+    std::optional<int> updateIntervalHours;
+
+    static SubscriptionMeta parse(const QMap<QString, QString> &headers);
+};
+
+/// Разбирает тело подписки: список ссылок, base64-список или sing-box JSON.
+/// Бросает std::invalid_argument на JSON-подписках (как в Dart).
+QList<VpnNode> parseSubscriptionBody(const QString &raw);
+</file>
+
+<file path="core/subscription/subscription_service.cpp">
+#include "subscription_service.h"
+#include "subscription_parser.h"
+
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QTimer>
+#include <QUrl>
+#include <QRegularExpression>
+
+SubscriptionService::SubscriptionService(QObject *parent)
+    : QObject(parent) {}
+
+void SubscriptionService::fetch(const QString &rawUrl)
+{
+    
+    const QUrl url(rawUrl.trimmed());
+    const QString scheme = url.scheme();
+    if (!url.isValid()
+        || (scheme != QLatin1String("http") && scheme != QLatin1String("https"))) {
+        emit failed(QStringLiteral("Нужна ссылка http:// или https://"));
+        return;
+    }
+
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader,
+                      QStringLiteral("clgvpn/0.1.0"));
+    request.setRawHeader("Accept", "*/*");
+    request.setTransferTimeout(20000);
+
+    QNetworkReply *reply = m_network.get(request);
+
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, url]() {
+        reply->deleteLater();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            emit failed(QStringLiteral("Не удалось подключиться: %1")
+                            .arg(reply->errorString()));
+            return;
+        }
+
+        const QByteArray body = reply->readAll();
+        const int status = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (status != 200) {
+            emit failed(QStringLiteral("Сервер ответил %1").arg(status));
+            return;
+        }
+
+        QMap<QString, QString> headers;
+        for (const auto &pair : reply->rawHeaderPairs())
+            headers.insert(QString::fromLatin1(pair.first),
+                           QString::fromLatin1(pair.second));
+
+        QList<VpnNode> nodes;
+        try {
+            nodes = parseSubscriptionBody(QString::fromUtf8(body));
+        } catch (const std::invalid_argument &e) {
+            emit failed(QString::fromStdString(e.what()));
+            return;
+        }
+
+        if (nodes.isEmpty()) {
+            emit failed(QStringLiteral("В подписке не нашлось поддерживаемых узлов"));
+            return;
+        }
+
+        const auto meta = SubscriptionMeta::parse(headers);
+
+        Subscription sub;
+        sub.id = subscriptionIdFor(url.toString());
+        sub.url = url.toString();
+        sub.title = meta.title.value_or(url.host());
+        sub.nodes = nodes;
+        sub.updatedAt = QDateTime::currentDateTimeUtc();
+        sub.traffic = meta.traffic;
+        sub.updateIntervalMinutes = meta.updateIntervalHours.value_or(12) * 60;
+
+        emit finished(sub);
+    });
+}
+</file>
+
+<file path="core/subscription/subscription_service.h">
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QNetworkAccessManager>
+#include "subscription.h"
+
+/// Загружает подписку по URL и превращает её в Subscription.
+class SubscriptionService : public QObject {
+    Q_OBJECT
+
+public:
+    explicit SubscriptionService(QObject *parent = nullptr);
+
+    /// Асинхронная загрузка. Сигналы:
+    ///   finished(Subscription) — при успехе
+    ///   failed(QString)        — при ошибке (сообщение для пользователя)
+    void fetch(const QString &rawUrl);
+
+signals:
+    void finished(Subscription subscription);
+    void failed(const QString &message);
+
+private:
+    QNetworkAccessManager m_network;
+};
+</file>
+
+<file path="core/subscription/subscription.cpp">
+#include "subscription.h"
+#include "../util/stable_hash.h"
+
+QJsonObject SubscriptionTraffic::toJson() const
+{
+    QJsonObject o;
+    o[QStringLiteral("upload")]   = static_cast<double>(upload);
+    o[QStringLiteral("download")] = static_cast<double>(download);
+    o[QStringLiteral("total")]    = static_cast<double>(total);
+    if (expire.has_value())
+        o[QStringLiteral("expire")] = expire->toString(Qt::ISODate);
+    return o;
+}
+
+SubscriptionTraffic SubscriptionTraffic::fromJson(const QJsonObject &json)
+{
+    SubscriptionTraffic t;
+    t.upload   = static_cast<qint64>(json.value(QStringLiteral("upload")).toDouble());
+    t.download = static_cast<qint64>(json.value(QStringLiteral("download")).toDouble());
+    t.total    = static_cast<qint64>(json.value(QStringLiteral("total")).toDouble());
+
+    const QString expireStr = json.value(QStringLiteral("expire")).toString();
+    if (!expireStr.isEmpty()) {
+        const QDateTime dt = QDateTime::fromString(expireStr, Qt::ISODate);
+        if (dt.isValid())
+            t.expire = dt;
+    }
+    return t;
+}
+
+bool SubscriptionTraffic::isExpired() const
+{
+    return expire.has_value() && expire->isValid()
+           && *expire < QDateTime::currentDateTime();
+}
+
+QJsonObject Subscription::toJson() const
+{
+    QJsonObject o;
+    o[QStringLiteral("id")]        = id;
+    o[QStringLiteral("url")]       = url;
+    o[QStringLiteral("title")]     = title;
+
+    QJsonArray nodesArr;
+    for (const auto &node : nodes)
+        nodesArr.append(node.toJson());
+    o[QStringLiteral("nodes")] = nodesArr;
+
+    o[QStringLiteral("updatedAt")] = updatedAt.toUTC().toString(Qt::ISODate);
+
+    if (traffic.has_value())
+        o[QStringLiteral("traffic")] = traffic->toJson();
+
+    o[QStringLiteral("updateIntervalMinutes")] = updateIntervalMinutes;
+    return o;
+}
+
+std::optional<Subscription> Subscription::fromJson(const QJsonObject &json)
+{
+    Subscription s;
+    s.id    = json.value(QStringLiteral("id")).toString();
+    s.url   = json.value(QStringLiteral("url")).toString();
+    s.title = json.value(QStringLiteral("title")).toString();
+
+    if (s.id.isEmpty() || s.url.isEmpty())
+        return std::nullopt;
+
+    const auto nodesArr = json.value(QStringLiteral("nodes")).toArray();
+    for (const auto &v : nodesArr) {
+        if (!v.isObject()) continue;
+        const auto node = VpnNode::fromJson(v.toObject());
+        if (node.has_value())
+            s.nodes.append(*node);
+    }
+
+    s.updatedAt = QDateTime::fromString(
+        json.value(QStringLiteral("updatedAt")).toString(), Qt::ISODate);
+    if (!s.updatedAt.isValid())
+        s.updatedAt = QDateTime::fromSecsSinceEpoch(0);
+
+    if (json.contains(QStringLiteral("traffic")) &&
+        json.value(QStringLiteral("traffic")).isObject()) {
+        s.traffic = SubscriptionTraffic::fromJson(
+            json.value(QStringLiteral("traffic")).toObject());
+    }
+
+    s.updateIntervalMinutes = json.value(QStringLiteral("updateIntervalMinutes"))
+                                  .toInt(720);
+    return s;
+}
+
+QString subscriptionIdFor(const QString &url)
+{
+    return QStringLiteral("s-") + stableHash32(url);
+}
+</file>
+
+<file path="core/subscription/subscription.h">
+#pragma once
+
+#include <QString>
+#include <QDateTime>
+#include <QList>
+#include <QJsonObject>
+#include <optional>
+
+#include "../model/vpn_node.h"
+
+/// Сколько трафика осталось по подписке (заголовок `subscription-userinfo`).
+struct SubscriptionTraffic {
+    qint64 upload = 0;
+    qint64 download = 0;
+    qint64 total = 0;              // 0 — безлимит
+    std::optional<QDateTime> expire;
+
+    qint64 used() const { return upload + download; }
+    bool isUnlimited() const { return total <= 0; }
+    bool isExpired() const;
+
+    QJsonObject toJson() const;
+    static SubscriptionTraffic fromJson(const QJsonObject &json);
+};
+
+/// Подписка: ссылка, узлы и метаданные из заголовков ответа.
+struct Subscription {
+    QString id;
+    QString url;
+    QString title;
+    QList<VpnNode> nodes;
+    QDateTime updatedAt;
+    std::optional<SubscriptionTraffic> traffic;
+    int updateIntervalMinutes = 720;   // 12 часов
+
+    QJsonObject toJson() const;
+    static std::optional<Subscription> fromJson(const QJsonObject &json);
+};
+
+/// Стабильный идентификатор подписки: хеш URL.
+QString subscriptionIdFor(const QString &url);
+</file>
+
+<file path="core/util/app_exception.h">
+#pragma once
+
+#include <stdexcept>
+#include <QString>
+
+/// Базовое исключение приложения: сообщение уже готово для показа пользователю.
+class AppException : public std::runtime_error {
+public:
+    explicit AppException(const QString &message)
+        : std::runtime_error(message.toStdString())
+        , m_message(message) {}
+
+    QString message() const { return m_message; }
+
+private:
+    QString m_message;
+};
+</file>
+
+<file path="core/util/base64.cpp">
+#include "base64.h"
+
+#include <QByteArray>
+#include <QRegularExpression>
+
+std::optional<QString> tryDecodeBase64(const QString &value)
+{
+    QString compact = value;
+    compact.remove(QRegularExpression(QStringLiteral("\\s")));
+    if (compact.isEmpty())
+        return std::nullopt;
+
+    compact.replace(QLatin1Char('-'), QLatin1Char('+'));
+    compact.replace(QLatin1Char('_'), QLatin1Char('/'));
+
+    const int pad = (4 - compact.size() % 4) % 4;
+    compact.append(QString(pad, QLatin1Char('=')));
+
+    const QByteArray bytes = QByteArray::fromBase64(
+        compact.toLatin1(), QByteArray::Base64Encoding);
+    if (bytes.isEmpty() && !compact.isEmpty() && compact != QStringLiteral("===="))
+        return std::nullopt;
+
+    // Проверка: fromBase64 молча игнорирует невалидные символы,
+    // поэтому перекодируем и сравниваем без паддинга.
+    const QByteArray reencoded = bytes.toBase64();
+    const QByteArray expected = compact.toLatin1();
+    if (reencoded != expected && reencoded != expected.left(expected.size() - pad))
+        return std::nullopt;
+
+    return QString::fromUtf8(bytes);
+}
+</file>
+
+<file path="core/util/base64.h">
+#pragma once
+
+#include <QString>
+#include <optional>
+
+/// Декодирует base64/base64url с переносами строк и без паддинга.
+/// Возвращает std::nullopt, если строка не является корректным base64.
+std::optional<QString> tryDecodeBase64(const QString &value);
+</file>
+
+<file path="core/util/format.cpp">
+#include "format.h"
+
+#include <array>
+
+QString formatBytes(qint64 bytes, int decimals)
+{
+    if (bytes <= 0)
+        return QStringLiteral("0 B");
+
+    static constexpr std::array<const char *, 5> units = {
+        "B", "KB", "MB", "GB", "TB"
+    };
+
+    double value = static_cast<double>(bytes);
+    int unit = 0;
+    while (value >= 1024.0 && unit < static_cast<int>(units.size()) - 1) {
+        value /= 1024.0;
+        ++unit;
+    }
+
+    const int digits = (unit == 0) ? 0 : decimals;
+    return QStringLiteral("%1 %2")
+        .arg(QString::number(value, 'f', digits))
+        .arg(QString::fromLatin1(units[unit]));
+}
+
+static QString two(int v)
+{
+    return QString::number(v).rightJustified(2, QLatin1Char('0'));
+}
+
+QString formatDate(const QDateTime &date)
+{
+    return QStringLiteral("%1.%2.%3")
+        .arg(two(date.date().day()))
+        .arg(two(date.date().month()))
+        .arg(date.date().year());
+}
+
+QString formatTime(const QDateTime &date)
+{
+    return QStringLiteral("%1:%2")
+        .arg(two(date.time().hour()))
+        .arg(two(date.time().minute()));
+}
+
+QString formatMoment(const QDateTime &date)
+{
+    const QDate today = QDate::currentDate();
+    const bool sameDay = (today == date.date());
+    return sameDay ? formatTime(date) : formatDate(date);
+}
+
+QString formatUptime(qint64 seconds)
+{
+    const qint64 hours = seconds / 3600;
+    const qint64 minutes = (seconds % 3600) / 60;
+    const qint64 secs = seconds % 60;
+
+    if (hours > 0)
+        return QStringLiteral("%1:%2:%3")
+            .arg(hours)
+            .arg(two(static_cast<int>(minutes)))
+            .arg(two(static_cast<int>(secs)));
+
+    return QStringLiteral("%1:%2")
+        .arg(two(static_cast<int>(minutes)))
+        .arg(two(static_cast<int>(secs)));
+}
+</file>
+
+<file path="core/util/format.h">
+#pragma once
+
+#include <QString>
+#include <QDateTime>
+
+/// 1536 -> "1.5 KB"
+QString formatBytes(qint64 bytes, int decimals = 1);
+
+QString formatDate(const QDateTime &date);   // 05.12.2026
+QString formatTime(const QDateTime &date);   // 14:03
+QString formatMoment(const QDateTime &date); // сегодня -> время, иначе дата
+
+/// Время работы туннеля: "05:12", "2:03:44".
+QString formatUptime(qint64 seconds);
+</file>
+
+<file path="core/util/stable_hash.cpp">
+#include "stable_hash.h"
+
+QString stableHash32(const QString &source)
+{
+    quint32 hash = 0x811C9DC5u;
+    const auto *data = reinterpret_cast<const char16_t *>(source.utf16());
+    const int length = source.size();
+
+    for (int i = 0; i < length; ++i) {
+        hash ^= static_cast<quint32>(data[i]);
+        hash = (hash * 0x01000193u) & 0xFFFFFFFFu;
+    }
+
+    return QString::number(hash, 16).rightJustified(8, QLatin1Char('0'));
+}
+</file>
+
+<file path="core/util/stable_hash.h">
+#pragma once
+
+#include <QString>
+
+/// Стабильный 32-битный FNV-1a хеш по UTF-16 code units.
+/// Должен совпадать с Dart-версией (stable_hash.dart) бит-в-бит.
+QString stableHash32(const QString &source);
+</file>
+
+<file path="core/app_controller.cpp">
+// src/core/app_controller.cpp
+#include "app_controller.h"
+
+#include "engine/tunnel_controller.h"
+#include "engine/tunnel_state.h"
+#include "engine/log_buffer.h"
+#include "subscription/subscription_manager.h"
+#include "subscription/subscription_service.h"
+#include "subscription/subscription_store.h"
+#include "storage/settings_store.h"
+#include "storage/app_paths.h"
+#include "subscription/auto_refresh.h"
+#include "util/format.h"
+#include "model/vpn_node.h"
+
+#include <QDir>
+#include <QTimer>
+
+AppController::AppController(QObject *parent)
+    : QObject(parent)
+{
+    // Таймер обновления uptime — раз в секунду эмитим stateChanged.
+    m_uptimeTimer.setInterval(1000);
+    connect(&m_uptimeTimer, &QTimer::timeout, this, [this]() {
+        if (m_tunnel && isConnected(m_tunnel->state().status))
+            emit stateChanged();
+    });
+    m_uptimeTimer.start();
+}
+
+AppController::~AppController() = default;
+
+void AppController::init(const QString &dataDir)
+{
+    m_dataDir = dataDir;
+    QDir().mkpath(dataDir);
+
+    m_settingsStore = std::make_unique<SettingsStore>(
+        QDir(dataDir).filePath(QStringLiteral("settings.json")));
+    m_settings = m_settingsStore->load();
+
+    m_subscriptionStore = std::make_unique<SubscriptionStore>(
+        QDir(dataDir).filePath(QStringLiteral("subscriptions.json")));
+    m_subscriptionService = std::make_unique<SubscriptionService>();
+    m_subscriptions = std::make_unique<SubscriptionsManager>(
+        m_subscriptionService.get(), m_subscriptionStore.get());
+    m_subscriptions->loadFromStore();
+
+    m_autoRefresh = std::make_unique<SubscriptionAutoRefresh>(m_subscriptions.get());
+
+    m_tunnel = std::make_unique<TunnelController>();
+    connect(m_tunnel.get(), &TunnelController::stateChanged,
+            this, &AppController::onStateChanged);
+
+    connect(m_subscriptions.get(), &SubscriptionsManager::subscriptionsChanged,
+            this, [this]() {
+        rebuildNodeLists();
+        emit subscriptionsChanged();
+    });
+    connect(m_subscriptions.get(), &SubscriptionsManager::subscriptionAdded,
+            this, [this](const Subscription &sub) {
+        emit subscriptionAdded(sub.title, sub.nodes.size());
+    });
+    connect(m_subscriptions.get(), &SubscriptionsManager::errorOccurred,
+            this, [this](const QString &msg) {
+        emit errorOccurred(msg);
+    });
+
+    m_autoRefresh->start();
+    rebuildNodeLists();
+
+    // Если был выбран узел и включён autoConnect — поднимаем туннель.
+    if (m_settings.autoConnect && m_settings.selectedNodeTag.has_value()) {
+        const VpnNode *node = nullptr;
+        for (const auto &n : m_nodesCache) {
+            if (n.tag == *m_settings.selectedNodeTag) { node = &n; break; }
+        }
+        if (node) {
+            QTimer::singleShot(500, this, [this, n = *node]() {
+                m_tunnel->start(n, workingDir(), m_settings);
+            });
+        }
+    }
+}
+
+// --- Tunnel getters ---
+
+int AppController::status() const
+{
+    return m_tunnel ? static_cast<int>(m_tunnel->state().status) : 0;
+}
+
+QString AppController::serverName() const
+{
+    return m_tunnel ? m_tunnel->state().serverName : QString();
+}
+
+QString AppController::statusText() const
+{
+    if (!m_tunnel) return {};
+    switch (m_tunnel->state().status) {
+    case TunnelStatus::Disconnected:  return tr("Disconnected");
+    case TunnelStatus::Connecting:    return tr("Connecting…");
+    case TunnelStatus::Connected:     return tr("Connected");
+    case TunnelStatus::Disconnecting: return tr("Disconnecting…");
+    }
+    return {};
+}
+
+qint64 AppController::downloadedBytes() const
+{
+    return m_tunnel ? m_tunnel->state().downloadedBytes : 0;
+}
+
+qint64 AppController::uploadedBytes() const
+{
+    return m_tunnel ? m_tunnel->state().uploadedBytes : 0;
+}
+
+QString AppController::error() const
+{
+    if (!m_tunnel) return {};
+    const auto &e = m_tunnel->state().error;
+    return e.has_value() ? *e : QString();
+}
+
+QString AppController::hint() const
+{
+    if (!m_tunnel) return {};
+    const auto &h = m_tunnel->state().hint;
+    if (!h.has_value()) return {};
+    switch (*h) {
+    case TunnelHint::TunUnavailable:
+        return tr("Proxy mode: TUN needs privileges. Install the clgvpn package "
+                  "(it grants CAP_NET_ADMIN) or run as root.");
+    case TunnelHint::KillSwitchFailed:
+        return tr("Kill switch failed: traffic is not blocked");
+    }
+    return {};
+}
+
+bool AppController::killSwitchActive() const
+{
+    return m_tunnel && m_tunnel->state().killSwitchActive;
+}
+
+QString AppController::uptimeText() const
+{
+    if (!m_tunnel) return {};
+    const auto &ca = m_tunnel->state().connectedAt;
+    if (!ca.has_value()) return {};
+    const qint64 secs = ca->secsTo(QDateTime::currentDateTimeUtc());
+    return formatUptime(secs);
+}
+
+QString AppController::modeText() const
+{
+    if (!m_tunnel) return {};
+    const auto &m = m_tunnel->state().mode;
+    if (!m.has_value()) return {};
+    return *m == TunnelMode::Tun ? tr("TUN (system)") : tr("Proxy (SOCKS/HTTP)");
+}
+
+void AppController::toggleConnection()
+{
+    if (!m_tunnel) return;
+
+    const auto st = m_tunnel->state().status;
+    if (st == TunnelStatus::Connected) {
+        m_tunnel->disconnect();
+        return;
+    }
+    if (st == TunnelStatus::Disconnected) {
+        const auto &tag = m_settings.selectedNodeTag;
+        if (!tag.has_value()) {
+            emit errorOccurred(tr("Select a server first"));
+            return;
+        }
+        for (const auto &n : m_nodesCache) {
+            if (n.tag == *tag) {
+                m_tunnel->start(n, workingDir(), m_settings);
+                return;
+            }
+        }
+    }
+}
+
+void AppController::refreshExitIp()
+{
+    // TODO: подключить IpCheckService, когда будем показывать IP в UI
+}
+
+void AppController::clearError()
+{
+    if (m_tunnel) m_tunnel->clearError();
+}
+
+void AppController::onStateChanged(const TunnelState &)
+{
+    emit stateChanged();
+
+    const auto &err = m_tunnel->state().error;
+    if (err.has_value() && !err->isEmpty())
+        emit errorOccurred(*err);
+}
+
+// --- Settings ---
+
+int AppController::routingMode() const
+{
+    return static_cast<int>(m_settings.routingMode);
+}
+bool AppController::autoConnect() const { return m_settings.autoConnect; }
+bool AppController::killSwitch() const { return m_settings.killSwitch; }
+QString AppController::localeCode() const
+{
+    return m_settings.localeCode.value_or(QString());
+}
+QString AppController::selectedNodeTag() const
+{
+    return m_settings.selectedNodeTag.value_or(QString());
+}
+
+void AppController::setRoutingMode(int mode)
+{
+    m_settings.routingMode = static_cast<RoutingMode>(mode);
+    saveSettings();
+    emit settingsChanged();
+}
+
+void AppController::setAutoConnect(bool value)
+{
+    m_settings.autoConnect = value;
+    saveSettings();
+    emit settingsChanged();
+}
+
+void AppController::setKillSwitch(bool value)
+{
+    m_settings.killSwitch = value;
+    saveSettings();
+    emit settingsChanged();
+}
+
+void AppController::setLocaleCode(const QString &code)
+{
+    if (code.isEmpty())
+        m_settings.localeCode.reset();
+    else
+        m_settings.localeCode = code;
+    saveSettings();
+    emit settingsChanged();
+}
+
+void AppController::saveSettings()
+{
+    if (m_settingsStore)
+        m_settingsStore->save(m_settings);
+}
+
+// --- Nodes ---
+
+QVariantList AppController::nodes() const
+{
+    QVariantList out;
+    for (const auto &n : m_nodesCache) {
+        QVariantMap m;
+        m[QStringLiteral("tag")] = n.tag;
+        m[QStringLiteral("name")] = n.name;
+        m[QStringLiteral("protocol")] = protocolToString(n.protocol);
+        m[QStringLiteral("endpoint")] = n.endpointLabel();
+        m[QStringLiteral("selected")] = (m_settings.selectedNodeTag == n.tag);
+        out.append(m);
+    }
+    return out;
+}
+
+QVariantList AppController::subscriptions() const
+{
+    QVariantList out;
+    if (!m_subscriptions) return out;
+    for (const auto &s : m_subscriptions->subscriptions()) {
+        QVariantMap m;
+        m[QStringLiteral("id")] = s.id;
+        m[QStringLiteral("title")] = s.title;
+        m[QStringLiteral("nodeCount")] = s.nodes.size();
+        m[QStringLiteral("updatedAt")] = s.updatedAt;
+        out.append(m);
+    }
+    return out;
+}
+
+QString AppController::selectedNodeName() const
+{
+    const auto &tag = m_settings.selectedNodeTag;
+    if (!tag.has_value()) return {};
+    for (const auto &n : m_nodesCache) {
+        if (n.tag == *tag) return n.name;
+    }
+    return {};
+}
+
+void AppController::selectNode(const QString &tag)
+{
+    if (tag.isEmpty()) {
+        m_settings.selectedNodeTag.reset();
+    } else {
+        m_settings.selectedNodeTag = tag;
+    }
+    saveSettings();
+    rebuildNodeLists();
+    emit selectedNodeChanged();
+    emit settingsChanged();
+}
+
+void AppController::addSubscription(const QString &url)
+{
+    if (m_subscriptions) m_subscriptions->add(url);
+}
+
+void AppController::refreshSubscription(const QString &id)
+{
+    if (m_subscriptions) m_subscriptions->refresh(id);
+}
+
+void AppController::removeSubscription(const QString &id)
+{
+    if (m_subscriptions) m_subscriptions->remove(id);
+}
+
+void AppController::addLink(const QString &url)
+{
+    // Пока не поддерживаем ручные ссылки — только подписки.
+    Q_UNUSED(url);
+    emit errorOccurred(tr("Adding single links is not supported yet"));
+}
+
+void AppController::rebuildNodeLists()
+{
+    m_nodesCache.clear();
+    if (m_subscriptions) {
+        for (const auto &sub : m_subscriptions->subscriptions())
+            for (const auto &n : sub.nodes)
+                m_nodesCache.append(n);
+    }
+}
+
+// --- Logs ---
+
+QStringList AppController::logs() const
+{
+    return m_tunnel && m_tunnel->logBuffer()
+               ? m_tunnel->logBuffer()->lines()
+               : QStringList{};
+}
+
+void AppController::clearLogs()
+{
+    if (m_tunnel && m_tunnel->logBuffer()) {
+        m_tunnel->logBuffer()->clear();
+        emit logsChanged();
+    }
+}
+
+// --- Utility ---
+
+QString AppController::formatBytes(qint64 bytes) const
+{
+    return ::formatBytes(bytes);
+}
+
+QString AppController::formatMoment(const QDateTime &dt) const
+{
+    return ::formatMoment(dt);
+}
+
+QString AppController::dataDir() const { return m_dataDir; }
+
+QString AppController::workingDir() const
+{
+    return QDir(m_dataDir).filePath(QStringLiteral("runtime"));
+}
+</file>
+
+<file path="core/app_controller.h">
+// src/core/app_controller.h
+#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QList>
+#include <QJsonObject>
+#include <memory>
+
+#include "engine/tunnel_controller.h"
+#include "settings/app_settings.h"
+
+class SubscriptionsManager;
+class SubscriptionService;
+class SubscriptionStore;
+class SettingsStore;
+class SubscriptionAutoRefresh;
+class QNetworkAccessManager;
+
+class AppController : public QObject {
+    Q_OBJECT
+
+    // --- Tunnel state (для QML) ---
+    Q_PROPERTY(int status READ status NOTIFY stateChanged)
+    Q_PROPERTY(QString serverName READ serverName NOTIFY stateChanged)
+    Q_PROPERTY(QString statusText READ statusText NOTIFY stateChanged)
+    Q_PROPERTY(qint64 downloadedBytes READ downloadedBytes NOTIFY stateChanged)
+    Q_PROPERTY(qint64 uploadedBytes READ uploadedBytes NOTIFY stateChanged)
+    Q_PROPERTY(QString error READ error NOTIFY stateChanged)
+    Q_PROPERTY(QString hint READ hint NOTIFY stateChanged)
+    Q_PROPERTY(bool killSwitchActive READ killSwitchActive NOTIFY stateChanged)
+    Q_PROPERTY(QString uptimeText READ uptimeText NOTIFY stateChanged)
+    Q_PROPERTY(QString modeText READ modeText NOTIFY stateChanged)
+
+    // --- Settings ---
+    Q_PROPERTY(int routingMode READ routingMode NOTIFY settingsChanged)
+    Q_PROPERTY(bool autoConnect READ autoConnect NOTIFY settingsChanged)
+    Q_PROPERTY(bool killSwitch READ killSwitch NOTIFY settingsChanged)
+    Q_PROPERTY(QString localeCode READ localeCode NOTIFY settingsChanged)
+    Q_PROPERTY(QString selectedNodeTag READ selectedNodeTag NOTIFY settingsChanged)
+
+    // --- Nodes / subscriptions ---
+    Q_PROPERTY(QVariantList nodes READ nodes NOTIFY subscriptionsChanged)
+    Q_PROPERTY(QVariantList subscriptions READ subscriptions NOTIFY subscriptionsChanged)
+    Q_PROPERTY(QString selectedNodeName READ selectedNodeName NOTIFY selectedNodeChanged)
+
+public:
+    explicit AppController(QObject *parent = nullptr);
+    ~AppController() override;
+
+    /// Инициализация: загружает настройки, подписки, запускает автообновление.
+    /// Вызывается из main() до engine.load().
+    void init(const QString &dataDir);
+
+    // --- Tunnel ---
+    int status() const;
+    QString serverName() const;
+    QString statusText() const;
+    qint64 downloadedBytes() const;
+    qint64 uploadedBytes() const;
+    QString error() const;
+    QString hint() const;
+    bool killSwitchActive() const;
+    QString uptimeText() const;
+    QString modeText() const;
+
+    Q_INVOKABLE void toggleConnection();
+    Q_INVOKABLE void refreshExitIp();
+    Q_INVOKABLE void clearError();
+
+    // --- Settings ---
+    int routingMode() const;
+    bool autoConnect() const;
+    bool killSwitch() const;
+    QString localeCode() const;
+    QString selectedNodeTag() const;
+
+    Q_INVOKABLE void setRoutingMode(int mode);
+    Q_INVOKABLE void setAutoConnect(bool value);
+    Q_INVOKABLE void setKillSwitch(bool value);
+    Q_INVOKABLE void setLocaleCode(const QString &code);
+
+    // --- Nodes ---
+    QVariantList nodes() const;
+    QVariantList subscriptions() const;
+    QString selectedNodeName() const;
+
+    Q_INVOKABLE void selectNode(const QString &tag);
+    Q_INVOKABLE void addSubscription(const QString &url);
+    Q_INVOKABLE void refreshSubscription(const QString &id);
+    Q_INVOKABLE void removeSubscription(const QString &id);
+    Q_INVOKABLE void addLink(const QString &url);
+
+    // --- Logs ---
+    Q_INVOKABLE QStringList logs() const;
+    Q_INVOKABLE void clearLogs();
+
+    // --- Utility (форматирование для QML) ---
+    Q_INVOKABLE QString formatBytes(qint64 bytes) const;
+    Q_INVOKABLE QString formatMoment(const QDateTime &dt) const;
+
+signals:
+    void stateChanged();
+    void settingsChanged();
+    void subscriptionsChanged();
+    void selectedNodeChanged();
+    void logsChanged();
+    void errorOccurred(const QString &message);
+    void subscriptionAdded(const QString &title, int nodeCount);
+
+private:
+    void onStateChanged(const TunnelState &state);
+    void rebuildNodeLists();
+    void saveSettings();
+    QString dataDir() const;
+    QString workingDir() const;
+
+    std::unique_ptr<SubscriptionService> m_subscriptionService;
+    std::unique_ptr<SubscriptionStore> m_subscriptionStore;
+    std::unique_ptr<SettingsStore> m_settingsStore;
+    std::unique_ptr<SubscriptionsManager> m_subscriptions;
+    std::unique_ptr<SubscriptionAutoRefresh> m_autoRefresh;
+    std::unique_ptr<TunnelController> m_tunnel;
+
+    AppSettings m_settings;
+    QList<VpnNode> m_nodesCache;
+    QString m_dataDir;
+    QTimer m_uptimeTimer;
+};
+</file>
+
+<file path="main.cpp">
+#include <QGuiApplication>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QTranslator>
+#include <QLocale>
+#include <QStandardPaths>
+#include <QDir>
+#include <QSharedMemory>
+#include <QMessageBox>
+
+#include "core/app_controller.h"
+
+int main(int argc, char *argv[])
+{
+    QGuiApplication app(argc, argv);
+    app.setApplicationName(QStringLiteral("clgvpn"));
+    app.setOrganizationName(QStringLiteral("clgvpn"));
+    app.setApplicationVersion(QStringLiteral("0.1.0"));
+
+    QQuickStyle::setStyle(QStringLiteral("Material"));
+
+    // Single-instance
+    QSharedMemory sharedMemory(QStringLiteral("clgvpn-single-instance"));
+    if (!sharedMemory.create(1)) {
+        QMessageBox::warning(nullptr, QStringLiteral("clgvpn"),
+                             QStringLiteral("clgvpn is already running."));
+        return 1;
+    }
+
+    // Каталог данных
+    const QString dataDir = QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation);
+    QDir().mkpath(dataDir + QStringLiteral("/core"));
+
+    // AppController — фасад для QML
+    AppController controller;
+    controller.init(dataDir + QStringLiteral("/core"));
+
+    // Переводчик
+    QTranslator translator;
+    const QString localeCode = controller.localeCode();
+    const QLocale locale = localeCode.isEmpty()
+                               ? QLocale::system()
+                               : QLocale(localeCode);
+    if (translator.load(locale, QStringLiteral("app"), QStringLiteral("_"),
+                        QStringLiteral(":/i18n"))) {
+        QCoreApplication::installTranslator(&translator);
+    }
+
+    // QML
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(
+        QStringLiteral("App"), &controller);
+
+    QObject::connect(
+        &engine, &QQmlApplicationEngine::objectCreationFailed,
+        &app, []() { QCoreApplication::exit(-1); },
+        Qt::QueuedConnection);
+
+    engine.loadFromModule("Clgvpn", "Main");
+    if (engine.rootObjects().isEmpty())
+        return -1;
+
+    return app.exec();
+}
+</file>
+
+</files>
